@@ -21,13 +21,39 @@ object HoistMemoryAllocations {
 
     val rewrittenPhrase = VisitAndRebuild(originalPhrase, visitor)
 
-    (visitor.getReplacedAllocations, rewrittenPhrase)
+    (normalizeAllocations(visitor.getReplacedAllocations), rewrittenPhrase)
     //    // Create a fresh allocation for every replaced New node using initially the
     //    // rewrittenPhrase and then the previous New node as its nested body
     //    replacedAllocations.foldLeft(rewrittenPhrase)((prev, alloc) => {
     //      val (addressSpace, identifier) = alloc
     //      New(identifier.t.t1.dataType, addressSpace, LambdaPhrase(identifier, prev))
     //    })
+  }
+
+  private def normalizeAllocations(
+      allocations: scala.Seq[AllocationInfo]
+  ): scala.Seq[AllocationInfo] = {
+    allocations.foldRight(Vector.empty[AllocationInfo]) { (alloc, normalized) =>
+      normalized.indexWhere(_.identifier.name == alloc.identifier.name) match {
+        case -1 =>
+          alloc +: normalized
+
+        case idx =>
+          val existing = normalized(idx)
+          if (
+            existing.addressSpace != alloc.addressSpace ||
+              existing.identifier.t.t1.dataType != alloc.identifier.t.t1.dataType
+          ) {
+            throw new Exception(
+              "conflicting hoisted memory allocations for " +
+                s"'${alloc.identifier.name}': " +
+                s"${existing.addressSpace} ${existing.identifier.t.t1.dataType} vs " +
+                s"${alloc.addressSpace} ${alloc.identifier.t.t1.dataType}"
+            )
+          }
+          normalized
+      }
+    }
   }
 
   private class VisitorScope(var replacedAllocations: List[AllocationInfo]) {
@@ -68,28 +94,27 @@ object HoistMemoryAllocations {
       private def replaceNew(addressSpace: AddressSpace,
                              variable: Identifier[VarType],
                              body: Phrase[CommType]): Phrase[CommType] = {
-        // Replace `new` node by looking through the information from the `par for`s, ...
-        val (finalVariable, finalBody) = parForInfos.foldLeft((variable, body)) {
-          // ... to rewrite the new's body given the oldParam, oldBody,
-          // as well as the index `i` and length `n` of a `par for` ...
-          case ((oldVariable, oldBody), ParForInfo(parallelismLevel, n, i)) =>
-            addressSpace match {
-              case AddressSpace.Global =>
+        // Replace `new` node by looking through the information from the `par for`s.
+        //
+        // Global memory can be hoisted across all surrounding parallel loops by
+        // adding one allocation dimension for each loop.
+        //
+        // Local memory has OpenCL work-group scope. It can be hoisted through
+        // local/sequential loops, but it must stop at the nearest work-group
+        // boundary. Hoisting it further outside a global loop would lose the
+        // per-work-group ownership of `__local` memory.
+        val (finalVariable, finalBody) = addressSpace match {
+          case AddressSpace.Global =>
+            parForInfos.foldLeft((variable, body)) {
+              case ((oldVariable, oldBody), ParForInfo(_, n, i)) =>
                 performRewrite(oldVariable, oldBody, i, n)
-              case AddressSpace.Local =>
-                parallelismLevel match {
-                  case OpenCL.Local | OpenCL.Sequential =>
-                    performRewrite(oldVariable, oldBody, i, n)
-                  case OpenCL.Global =>
-                    throw new Exception("hoisting local memory outside of global parallelism is not implemented")
-                  case OpenCL.WorkGroup => // do not perform the substitution
-                    (oldVariable, oldBody)
-                  case OpenCL.Warp | OpenCL.Lane =>
-                    throw new Exception("This should not happen")
-                }
-              case AddressSpace.Private | AddressSpace.Constant | AddressSpaceIdentifier(_) =>
-                throw new Exception("This can't happen")
             }
+
+          case AddressSpace.Local =>
+            hoistLocalUntilWorkGroup(variable, body, parForInfos)
+
+          case AddressSpace.Private | AddressSpace.Constant | AddressSpaceIdentifier(_) =>
+            throw new Exception("This can't happen")
         }
 
         // ... remember `finalVariable' to regenerate the `new' at the
@@ -97,6 +122,37 @@ object HoistMemoryAllocations {
         // replaces the old `new` node
         replacedAllocations = AllocationInfo(addressSpace, finalVariable) :: replacedAllocations
         VisitAndRebuild(finalBody, this)
+      }
+
+      private def hoistLocalUntilWorkGroup(
+          variable: Identifier[VarType],
+          body: Phrase[CommType],
+          infos: List[ParForInfo]
+      ): (Identifier[VarType], Phrase[CommType]) = {
+        infos.foldLeft((variable, body, false)) {
+          case ((oldVariable, oldBody, true), _) =>
+            (oldVariable, oldBody, true)
+
+          case ((oldVariable, oldBody, false), ParForInfo(parallelismLevel, n, i)) =>
+            parallelismLevel match {
+              case OpenCL.Local | OpenCL.Sequential =>
+                val (newVariable, newBody) = performRewrite(oldVariable, oldBody, i, n)
+                (newVariable, newBody, false)
+
+              case OpenCL.WorkGroup =>
+                (oldVariable, oldBody, true)
+
+              case OpenCL.Global =>
+                throw new Exception(
+                  "local memory allocation must be inside an explicit work-group scope; " +
+                    "place toLocal under mapWorkGroup/mapLocal or use global/private memory")
+
+              case OpenCL.Warp | OpenCL.Lane =>
+                throw new Exception("This should not happen")
+            }
+        } match {
+          case (finalVariable, finalBody, _) => (finalVariable, finalBody)
+        }
       }
 
       private def performRewrite(oldVariable: Identifier[VarType],

@@ -183,6 +183,9 @@ private class InferAccessAnnotation {
     ctx: Context,
     isKernelParamFun: Boolean
   ): (PhraseType, Subst) = {
+    if (isMaterializeFunction(app.f))
+      return inferMaterializeApp(app, ctx, isKernelParamFun)
+
     val (fType, fSubst) = inferPhraseTypes(app.f, ctx, isKernelParamFun)
     val (eType, eSubst) = inferPhraseTypes(app.e, fSubst(ctx), isKernelParamFun)
     val eSubstFType =
@@ -198,6 +201,38 @@ private class InferAccessAnnotation {
     val resSubst = subst(eSubst(fSubst))
     ptAnnotationMap.put(app, appType)
     (appType, resSubst)
+  }
+
+  private def inferMaterializeApp(
+    app: r.App,
+    ctx: Context,
+    isKernelParamFun: Boolean
+  ): (PhraseType, Subst) = {
+    val (fType, fSubst) = inferPhraseTypes(app.f, ctx, isKernelParamFun)
+
+    // `materialize` is the only explicit read-to-write boundary.  Infer its
+    // input in a read context so an outer output/write requirement cannot leak
+    // into structural producers such as generate/map/reduce.
+    val (eType, eSubst) = inferPhraseTypes(app.e, fSubst(ctx), isKernelParamFun = false)
+    val eSubstFType =
+      eSubst(fType).asInstanceOf[FunType[_ <: PhraseType, _ <: PhraseType]]
+
+    val subst = subUnifyPhraseType(eType, eSubstFType.inT) match {
+      case Success(subst) => subst
+      case Failure(exception) =>
+        error(s"Failure when inferring access annotations for explicit materialize:\n" +
+          s"$app\nwith context:\n$ctx\n${exception.getMessage}")
+    }
+    val appType = subst(eSubstFType.outT)
+    val resSubst = subst(eSubst(fSubst))
+    ptAnnotationMap.put(app, appType)
+    (appType, resSubst)
+  }
+
+  private def isMaterializeFunction(e: r.Expr): Boolean = e match {
+    case p: r.Primitive => rp.materialize.unapply(p)
+    case r.DepApp(_, f, _) => isMaterializeFunction(f)
+    case _ => false
   }
 
   private def inferDepLambda(
@@ -283,6 +318,25 @@ private class InferAccessAnnotation {
         case _ => error()
       }
 
+      case rp.materialize() => p.t match {
+        case (t: DataType) ->: (_: DataType) =>
+          expT(t, read) ->: expT(t, write)
+        case _ => error()
+      }
+
+      case rp.staticIterate() => p.t match {
+        case n `(Nat)->:`
+             ((IndexType(_) ->: ((dt1: DataType) ->: (dt2: DataType))) ->:
+             (dt3: DataType) ->:
+             (dt4: DataType)) =>
+          nFunT(n,
+            (expT(IndexType(n), read) ->:
+              (expT(dt1, read) ->: expT(dt2, read))) ->:
+              expT(dt3, read) ->:
+              expT(dt4, read))
+        case _ => error()
+      }
+
       case roclp.oclRunPrimitive() => p.t match {
         case ls1 `(Nat)->:` (ls2 `(Nat)->:` (ls3 `(Nat)->:`
           (gs1 `(Nat)->:` (gs2 `(Nat)->:` (gs3 `(Nat)->:`
@@ -359,9 +413,16 @@ private class InferAccessAnnotation {
         case _ => error()
       }
 
-      case rp.natAsIndex() | rp.take() | rp.drop() => p.t match {
+      case rp.natAsIndex() => p.t match {
         case n `(Nat)->:` ((dt1: DataType) ->: (dt2: DataType)) =>
           nFunT(n, expT(dt1, read) ->: expT(dt2, read))
+        case _ => error()
+      }
+
+      case rp.take() | rp.drop() => p.t match {
+        case n `(Nat)->:` ((dt1: DataType) ->: (dt2: DataType)) =>
+          val ai = accessTypeIdentifier()
+          nFunT(n, expT(dt1, ai) ->: expT(dt2, ai))
         case _ => error()
       }
 
@@ -369,8 +430,15 @@ private class InferAccessAnnotation {
         case ((t: DataType) ->: (s: DataType) ->: (_: DataType)) ->:
           (_: DataType) ->: (n`.`_) ->: (_: DataType) =>
 
-          (expT(t, read) ->: expT(s, read) ->: expT(t, write)) ->:
-            expT(t, write) ->: expT(n`.`s, read) ->: expT(t, read)
+          // RISE reductions are functional at this level: the combine function
+          // and the initial value compute read-valued results. The destination
+          // write happens later in acceptor translation when the accumulator is
+          // copied into its storage. Requiring a write-valued combine result
+          // makes aggregate accumulators such as [WLocal][CoutOffset].vec16
+          // depend on ad-hoc write shells and breaks generic destination
+          // passing.
+          (expT(t, read) ->: expT(s, read) ->: expT(t, read)) ->:
+            expT(t, read) ->: expT(n`.`s, read) ->: expT(t, read)
         case _ => error()
       }
 
@@ -389,8 +457,11 @@ private class InferAccessAnnotation {
             (_: DataType) ->: (n`.`_) ->: (_: DataType)) =>
 
           aFunT(a,
-            (expT(t, read) ->: expT(s, read) ->: expT(t, write)) ->:
-            expT(t, write) ->: expT(n`.`s, read) ->: expT(t, read))
+            // See the sequential reduce case above: functional reduction
+            // produces read-valued accumulator values; OpenCL storage writes
+            // are introduced by destination-passing lowering.
+            (expT(t, read) ->: expT(s, read) ->: expT(t, read)) ->:
+            expT(t, read) ->: expT(n`.`s, read) ->: expT(t, read))
         case _ => error()
       }
 

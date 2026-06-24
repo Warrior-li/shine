@@ -238,6 +238,17 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
     }
 
     case TakeAcc(_, _, _, a) => a |> acc(env, path, cont)
+    case PadEmptyAcc(n, _, _, a) => path match {
+      case (i: CIntExpr) :: ps =>
+        C.AST.IfThenElse(
+          C.AST.BinaryExpr(
+            C.AST.ArithmeticExpr(i),
+            C.AST.BinaryOperator.<,
+            C.AST.ArithmeticExpr(n)),
+          a |> acc(env, i :: ps, cont),
+          None)
+      case _ => error(s"Expected a C-Integer-Expression on the path.")
+    }
     case DropAcc(n, _, _, a) => path match {
       case (i: CIntExpr) :: ps => a |> acc(env, CIntExpr(i + n) :: ps, cont)
       case _ => error(s"Expected a C-Integer-Expression on the path.")
@@ -415,9 +426,9 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
     case Snd(_, _, e) => e |> exp(env, SndMember :: path, cont)
     case DMatch(_, _, _, _, _, e) => e |> exp(env, path, cont)
 
-    case Take(_, _, _, e) => e |> exp(env, path, cont)
+    case Take(_, _, _, _, e) => e |> exp(env, path, cont)
 
-    case Drop(n, _, _, e) => path match {
+    case Drop(n, _, _, _, e) => path match {
       case (i: CIntExpr) :: ps => e |> exp(env, CIntExpr(i + n) :: ps, cont)
       case _ => error(s"Expected a C-Integer-Expression on the path.")
     }
@@ -1254,4 +1265,3 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
     })
   }
 }
-

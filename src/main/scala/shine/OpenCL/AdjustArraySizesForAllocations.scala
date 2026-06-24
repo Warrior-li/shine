@@ -96,6 +96,14 @@ object AdjustArraySizesForAllocations {
 
       case Map(_, _, _, _, _, a) => visitAndGatherInformation(a, parallInfo)
 
+      // Pure array construction does not introduce an OpenCL placement level.
+      // Aggregate reduction initializers such as generate(i => zeroVec) must be
+      // allowed here; the later acceptor translation recursively writes their
+      // elements into the adjusted accumulator storage.
+      case _: Generate => parallInfo
+
+      case Materialize(_, input) => visitAndGatherInformation(input, parallInfo)
+
       // TODO: think more about these two, what about the indices?
       case Gather(_, _, _, indices, a) => visitAndGatherInformation(a, parallInfo)
       case Scatter(_, _, _, indices, a) => visitAndGatherInformation(a, parallInfo)

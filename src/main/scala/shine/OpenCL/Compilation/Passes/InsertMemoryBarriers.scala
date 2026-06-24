@@ -166,6 +166,7 @@ object InsertMemoryBarriers {
       case PairAcc(_, _, a, b) =>
         collectWrites(a, allocs, writes); collectWrites(b, allocs, writes)
       case TakeAcc(_, _, _, a) => collectWrites(a, allocs, writes)
+      case PadEmptyAcc(_, _, _, a) => collectWrites(a, allocs, writes)
       case TransposeAcc(_, _, _, a) => collectWrites(a, allocs, writes)
       // TODO: collect reads in indices?
       case ScatterAcc(_, _, _, indices, a) =>
@@ -222,8 +223,9 @@ object InsertMemoryBarriers {
           collectReads(_, allocs, reads)
         }
       case NatAsIndex(_, e) => collectReads(e, allocs, reads)
-      case Drop(_, _, _, e) => collectReads(e, allocs, reads)
-      case Take(_, _, _, e) => collectReads(e, allocs, reads)
+      case IndexAsNat(_, e) => collectReads(e, allocs, reads)
+      case Drop(_, _, _, _, e) => collectReads(e, allocs, reads)
+      case Take(_, _, _, _, e) => collectReads(e, allocs, reads)
       case Unzip(_, _, _, _, e) => collectReads(e, allocs, reads)
       case MakePair(_, _, _, e1, e2) =>
         collectReads(e1, allocs, reads); collectReads(e2, allocs, reads)

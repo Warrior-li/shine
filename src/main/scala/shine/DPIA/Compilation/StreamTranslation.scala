@@ -73,8 +73,8 @@ object StreamTranslation {
                   CycleAcc(size - 1 + n, size, dt2, bufWr)) `@` i)
               )) `;`
                 // use neighborhood
-                k(Take(size, n - i - size, dt2,
-                  Drop(i, n - i, dt2, Cycle(n, size, dt2, bufRd))))
+                k(Take(size, n - i - size, dt2, read,
+                  Drop(i, n - i, dt2, read, Cycle(n, size, dt2, bufRd))))
             ),
             arithexpr.arithmetic.RangeAdd(0, n, 1)
           ))
@@ -114,7 +114,7 @@ object StreamTranslation {
                 // rotate
                 comment("mapSeq") `;`
                 `for`(unroll = true, size - 1, i =>
-                  acc(write(Drop(1, size - 1, dt, rs.rd) `@` i))(TakeAcc(size - 1, 1, dt, rs.wr) `@` i))
+                  acc(write(Drop(1, size - 1, dt, read, rs.rd) `@` i))(TakeAcc(size - 1, 1, dt, rs.wr) `@` i))
             ),
             arithexpr.arithmetic.RangeAdd(0, n, 1)))
         }))
@@ -174,7 +174,7 @@ object StreamTranslation {
                     CycleAcc(size - 1 + n, alloc, dt2, bufWr)) `@` i)
                 )) `;`
                   // use neighborhood
-                  k(Drop(i, size, dt2,
+                  k(Drop(i, size, dt2, read,
                     Cycle(i + size, alloc, dt2, bufRd)))
               ),
               arithexpr.arithmetic.RangeAdd(0, n, 1)
@@ -203,7 +203,7 @@ object StreamTranslation {
               // rotate
               comment("mapSeq")`;`
               `for`(unroll = true, size - 1, i =>
-                acc(write(Drop(1, size - 1, dt, rs.rd) `@` i))(TakeAcc(size - 1, 1, dt, rs.wr) `@` i))
+                acc(write(Drop(1, size - 1, dt, read, rs.rd) `@` i))(TakeAcc(size - 1, 1, dt, rs.wr) `@` i))
             ),
             arithexpr.arithmetic.RangeAdd(0, n, 1)))
         })

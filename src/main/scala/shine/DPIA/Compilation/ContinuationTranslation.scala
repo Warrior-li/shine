@@ -115,9 +115,9 @@ object ContinuationTranslation {
               con(f(fst)(snd))(C)
             )), pair)))
 
-    case Drop(n, m, dt, array) =>
+    case Drop(n, m, dt, access, array) =>
       con(array)(fun(expT((n + m)`.` dt, read))(x =>
-        C(Drop(n, m, dt, x))))
+        C(Drop(n, m, dt, read, x))))
 
     case ffc@ForeignFunctionCall(funDecl, n) =>
       def rec(ts: Seq[(Phrase[ExpType], DataType)],
@@ -202,11 +202,18 @@ object ContinuationTranslation {
           case xf +: func => con(xf)(fun(expT(ma.dt, read))(xi =>
             rec(func, imp :+ xi)
           ))
-          case _ => C(MakeArray(ma.n)(ma.dt, imp))
+      case _ => C(MakeArray(ma.n)(ma.dt, imp))
         }
       }
 
       rec(ma.elements, Seq())
+
+    case Materialize(dt, input) =>
+      `new`(dt, tmp => acc(Materialize(dt, input))(tmp.wr) `;` C(tmp.rd))
+
+    case StaticIterate(_, dt, _, _) =>
+      shine.OpenCL.DSL.`new`(rise.core.types.AddressSpace.Private)(dt, tmp =>
+        acc(E)(tmp.wr) `;` C(tmp.rd))
 
     case makeDepPair@MakeDepPair(a, fst, sndT, snd) =>
       // Allocate for the resulting dependent pair,
@@ -310,9 +317,9 @@ object ContinuationTranslation {
       con(array)(fun(expT((m * n)`.`dt, read))(x =>
         C(Split(n, m, w, dt, x))))
 
-    case Take(n, m, dt, array) =>
+    case Take(n, m, dt, access, array) =>
       con(array)(fun(expT((n + m)`.`dt, read))(x =>
-        C(Take(n, m, dt, x))))
+        C(Take(n, m, dt, read, x))))
 
     case ToMem(dt, input) =>
       `new`(dt, tmp => acc(input)(tmp.wr) `;` C(tmp.rd))
@@ -391,12 +398,14 @@ object ContinuationTranslation {
         val adj = AdjustArraySizesForAllocations(init, dt2, a)
 
         comment("oclReduceSeq") `;`
+        shine.OpenCL.DSL.barrier(local = true, global = false) `;`
         (shine.OpenCL.DSL.`new` (a) (adj.dt, accumulator =>
           acc(init)(adj.accF(accumulator.wr)) `;`
             `for`(unroll, n, i =>
               acc( f(adj.exprF(accumulator.rd))(X `@` i) )(adj.accF(accumulator.wr)) ) `;`
             C(adj.exprF(accumulator.rd))
-        ))
+        )) `;`
+        shine.OpenCL.DSL.barrier(local = true, global = false)
       }))
 
     case ocl.ToMem(addrSpace, dt, input) =>

@@ -288,6 +288,20 @@ object fromRise {
             IterateStream(n, s, t, f, e)))
       }
 
+      case core.staticIterate() => fromType {
+        case nFunT(n,
+          (expT(IndexType(_), `read`) ->:
+            (expT(t1, `read`) ->: expT(t2, `read`))) ->:
+          expT(t3, `read`) ->:
+          expT(t4, `read`))
+        =>
+        depFun(NatKind, n)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(IndexType(n), read) ->: (expT(t1, read) ->: expT(t2, read)),
+            f => fun[ExpType](expT(t3, read), init =>
+              StaticIterate(n, t4, f, init))))
+      }
+
       case core.mapSeqUnroll() => fromType {
         case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
           expT(ArrayType(n, _), `read`) ->:
@@ -350,57 +364,57 @@ object fromRise {
       }
 
       case core.reduceSeq() => fromType {
-        case (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `write`)) ->:
-          expT(_, `write`) ->:
+        case (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `read`)) ->:
+          expT(_, `read`) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(_, `read`)
         =>
         fun[ExpType ->: ExpType ->: ExpType](
-          expT(t, read) ->: expT(s, read) ->: expT(t, write), f =>
-            fun[ExpType](expT(t, write), i =>
+          expT(t, read) ->: expT(s, read) ->: expT(t, read), f =>
+            fun[ExpType](expT(t, read), i =>
               fun[ExpType](expT(n`.`s, read), e =>
                 ReduceSeq(unroll = false)(n, s, t, f, i, e))))
       }
 
       case core.reduceSeqUnroll() => fromType {
-        case (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `write`)) ->:
-          expT(_, `write`) ->:
+        case (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `read`)) ->:
+          expT(_, `read`) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(_, `read`)
         =>
         fun[ExpType ->: ExpType ->: ExpType](
-          expT(t, read) ->: expT(s, read) ->: expT(t, write), f =>
-            fun[ExpType](expT(t, write), i =>
+          expT(t, read) ->: expT(s, read) ->: expT(t, read), f =>
+            fun[ExpType](expT(t, read), i =>
               fun[ExpType](expT(n`.`s, read), e =>
                 ReduceSeq(unroll = true)(n, s, t, f, i, e))))
       }
 
       case rocl.oclReduceSeq() => fromType {
         case aFunT(a,
-        (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `write`)) ->:
-          expT(_, `write`) ->:
+        (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `read`)) ->:
+          expT(_, `read`) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(_, `read`))
         =>
         depFun(AddressSpaceKind, a)(
           fun[ExpType ->: ExpType ->: ExpType](
-            expT(t, read) ->: expT(s, read) ->: expT(t, write), f =>
-              fun[ExpType](expT(t, write), i =>
+            expT(t, read) ->: expT(s, read) ->: expT(t, read), f =>
+              fun[ExpType](expT(t, read), i =>
                 fun[ExpType](expT(n`.`s, read), e =>
                   ocl.ReduceSeq(unroll = false)(n, a, s, t, f, i, e)))))
       }
 
       case rocl.oclReduceSeqUnroll() => fromType {
         case aFunT(a,
-        (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `write`)) ->:
-          expT(_, `write`) ->:
+        (expT(t, `read`) ->: expT(s, `read`) ->: expT(_, `read`)) ->:
+          expT(_, `read`) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(_, `read`))
         =>
         depFun(AddressSpaceKind, a)(
           fun[ExpType ->: ExpType ->: ExpType](
-            expT(t, read) ->: expT(s, read) ->: expT(t, write), f =>
-              fun[ExpType](expT(t, write), i =>
+            expT(t, read) ->: expT(s, read) ->: expT(t, read), f =>
+              fun[ExpType](expT(t, read), i =>
                 fun[ExpType](expT(n`.`s, read), e =>
                   ocl.ReduceSeq(unroll = true)(n, a, s, t, f, i, e)))))
       }
@@ -563,20 +577,20 @@ object fromRise {
       }
 
       case core.take() => fromType {
-        case nFunT(n, expT(ArrayType(nm, t), `read`) ->:
-          expT(ArrayType(_, _), `read`))
+        case nFunT(n, expT(ArrayType(nm, t), a) ->:
+          expT(ArrayType(_, _), _))
         =>
         depFun(NatKind, n)(
-          fun[ExpType](expT(nm`.`t, read), e => Take(n, nm-n, t, e)))
+          fun[ExpType](expT(nm`.`t, a), e => Take(n, nm-n, t, a, e)))
       }
 
       case core.drop() => fromType {
-        case nFunT(n, expT(ArrayType(nm, t), `read`) ->:
-          expT(ArrayType(_, _), `read`))
+        case nFunT(n, expT(ArrayType(nm, t), a) ->:
+          expT(ArrayType(_, _), _))
         =>
         depFun(NatKind, n)(
-          fun[ExpType](expT(nm`.`t, read), e =>
-            Drop(n, nm-n, t, e)))
+          fun[ExpType](expT(nm`.`t, a), e =>
+            Drop(n, nm-n, t, a, e)))
       }
 
       case core.padCst() => fromType {
@@ -902,6 +916,12 @@ object fromRise {
         case expT(t, `write`) ->: expT(_, `read`)
         =>
         fun[ExpType](expT(t, write), e => ToMem(t, e))
+      }
+
+      case core.materialize() => fromType {
+        case expT(t, `read`) ->: expT(_, `write`)
+        =>
+        fun[ExpType](expT(t, read), e => Materialize(t, e))
       }
 
       case rocl.oclToMem() => fromType {

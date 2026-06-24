@@ -53,6 +53,7 @@ object KernelModuleGenerator extends ModuleGenerator[KernelDef] {
       CModuleGenerator.imperativePasses andThen
       InsertMemoryBarriers.insert andThen
       HoistMemoryAllocations.hoist andThen
+      InsertHoistedLocalMemoryBarriers.insert andThen
       AdaptKernelParameters.adapt(gen, outParam, funDef.params)
   }
 

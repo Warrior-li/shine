@@ -1,18 +1,19 @@
 package shine.DPIA.Compilation
 
-import arithexpr.arithmetic.{NamedVar, RangeAdd}
+import arithexpr.arithmetic.{Cst, NamedVar, RangeAdd}
 import shine.DPIA.Compilation.TranslationToImperative._
 import shine.DPIA.DSL.{comment, _}
 import shine.DPIA.Phrases._
-import rise.core.types.{DataType, Fragment, MatrixLayout, NatIdentifier, NatKind, read, write}
+import rise.core.types.{AddressSpace, DataType, Fragment, MatrixLayout, NatIdentifier, NatKind, read, write}
 import rise.core.DSL.Type._
 import rise.core.types.DataType._
 import rise.core.substitute.{natInType => substituteNatInType}
-import shine.DPIA.Types.{AccType, CommType, ExpType, TypeCheck, comm}
+import shine.DPIA.Types.{AccType, CommType, ExpType, FunType, TypeCheck, comm}
 import rise.core.types.DataTypeOps._
 import shine.DPIA._
 import shine.DPIA.primitives.functional._
 import shine.DPIA.primitives.imperative.{Seq => _, _}
+import shine.OpenCL.AdjustArraySizesForAllocations
 import shine.OpenMP.primitives.{functional => omp}
 import shine.OpenCL.primitives.{functional => ocl}
 import shine.OpenCL.primitives.{imperative => oclImp}
@@ -34,6 +35,9 @@ object AcceptorTranslation {
           acc(Lifting.liftDependentFunction(
             fun.asInstanceOf[Phrase[`(dt)->:`[ExpType]]])(a))(A)
       }
+
+      case staticIterate@StaticIterate(_, _, _, _) =>
+        primitive(staticIterate)(A)
 
       case e
         if TypeCheck.notContainingArrayType(e.t.dataType)
@@ -84,7 +88,143 @@ object AcceptorTranslation {
 
   def primitive(E: ExpPrimitive)
                (A: Phrase[AccType])
-               (implicit context: TranslationContext): Phrase[CommType] = E match {
+               (implicit context: TranslationContext): Phrase[CommType] = {
+    def copyReadInto(
+      dt: DataType,
+      input: Phrase[ExpType],
+      output: Phrase[AccType]
+    ): Phrase[CommType] = {
+      def destinationPassingReduceSeq(
+        n: Nat,
+        dt1: DataType,
+        dt2: DataType,
+        f: Phrase[FunType[ExpType, FunType[ExpType, ExpType]]],
+        init: Phrase[ExpType],
+        array: Phrase[ExpType],
+        unroll: Boolean,
+        output: Phrase[AccType]
+      ): Phrase[CommType] =
+        con(array)(fun(expT(n`.`dt1, read))(x =>
+          comment("reduceSeq materialize") `;`
+            `new`(dt2, accumulator =>
+              copyReadInto(dt2, init, accumulator.wr) `;`
+                `for`(unroll, n, i =>
+                  copyReadInto(dt2, f(accumulator.rd)(x `@` i), accumulator.wr)) `;`
+                copyReadInto(dt2, accumulator.rd, output))))
+
+      def destinationPassingOclReduceSeq(
+        n: Nat,
+        addressSpace: AddressSpace,
+        dt1: DataType,
+        dt2: DataType,
+        f: Phrase[FunType[ExpType, FunType[ExpType, ExpType]]],
+        init: Phrase[ExpType],
+        array: Phrase[ExpType],
+        unroll: Boolean,
+        output: Phrase[AccType]
+      ): Phrase[CommType] =
+        con(array)(fun(expT(n`.`dt1, read))(x => {
+          val adj = AdjustArraySizesForAllocations(init, dt2, addressSpace)
+
+          comment("oclReduceSeq materialize") `;`
+            shine.OpenCL.DSL.barrier(local = true, global = false) `;`
+            shine.OpenCL.DSL.`new`(addressSpace)(adj.dt, accumulator =>
+              copyReadInto(dt2, init, adj.accF(accumulator.wr)) `;`
+                `for`(unroll, n, i =>
+                  copyReadInto(
+                    dt2,
+                    f(adj.exprF(accumulator.rd))(x `@` i),
+                    adj.accF(accumulator.wr))) `;`
+                copyReadInto(dt2, adj.exprF(accumulator.rd), output)) `;`
+            shine.OpenCL.DSL.barrier(local = true, global = false)
+        }))
+
+      def destinationPassingStaticIterate(
+        n: Nat,
+        dt: DataType,
+        f: Phrase[FunType[ExpType, FunType[ExpType, ExpType]]],
+        init: Phrase[ExpType],
+        output: Phrase[AccType]
+      ): Phrase[CommType] =
+        comment("staticIterate materialize") `;`
+          shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, accumulator =>
+            copyReadInto(dt, init, accumulator.wr) `;`
+              `for`(n, i =>
+                copyReadInto(dt, f(i)(accumulator.rd), accumulator.wr)) `;`
+              copyReadInto(dt, accumulator.rd, output))
+
+      input match {
+        case Materialize(_, inner) =>
+          copyReadInto(dt, inner, output)
+
+        case Generate(n, elemT, f) =>
+          dt match {
+            case ArrayType(_, _) =>
+              `for`(n, i => copyReadInto(elemT, f(i), output `@` i))
+            case _ =>
+              con(input)(fun(expT(dt, read))(x => output :=| dt | x))
+          }
+
+        case makeArray@MakeArray(n) =>
+          val (elemT, elements) = makeArray.unwrap
+          dt match {
+            case ArrayType(_, _) if n == elements.length =>
+              elements.zipWithIndex.foldLeft(
+                comment("materialize MakeArray"): Phrase[CommType]) {
+                case (body, (elem, idx)) =>
+                  body `;` copyReadInto(
+                    elemT,
+                    elem,
+                    output `@` Cst(idx))
+              }
+            case _ =>
+              con(input)(fun(expT(dt, read))(x => output :=| dt | x))
+          }
+
+        case MakePair(dt1, dt2, _, fst, snd) =>
+          copyReadInto(dt1, fst, pairAcc1(dt1, dt2, output)) `;`
+            copyReadInto(dt2, snd, pairAcc2(dt1, dt2, output))
+
+        case mapSeq@MapSeq(unroll) =>
+          val (n, dt1, dt2, f, array) = mapSeq.unwrap
+          con(array)(fun(expT(n`.`dt1, read))(x =>
+            comment("mapSeq materialize") `;`
+              `for`(unroll, n, i =>
+                copyReadInto(dt2, f(x `@` i), output `@` i))))
+
+        case reduceSeq@ReduceSeq(unroll) =>
+          val (n, dt1, dt2, f, init, array) = reduceSeq.unwrap
+          destinationPassingReduceSeq(n, dt1, dt2, f, init, array, unroll, output)
+
+        case reduceSeq@ocl.ReduceSeq(unroll) =>
+          val (n, addressSpace, dt1, dt2, f, init, array) = reduceSeq.unwrap
+          destinationPassingOclReduceSeq(
+            n, addressSpace, dt1, dt2, f, init, array, unroll, output)
+
+        case staticIterate@StaticIterate(_, _, _, _) =>
+          val (n, dt, f, init) = staticIterate.unwrap
+          destinationPassingStaticIterate(n, dt, f, init, output)
+
+        case _ =>
+          dt match {
+            case ArrayType(n, elemT) =>
+              con(input)(fun(expT(n`.`elemT, read))(x =>
+                `for`(n, i => copyReadInto(elemT, x `@` i, output `@` i))
+              ))
+            case PairType(dt1, dt2) =>
+              copyReadInto(dt1, Fst(dt1, dt2, input), pairAcc1(dt1, dt2, output)) `;`
+                copyReadInto(dt2, Snd(dt1, dt2, input), pairAcc2(dt1, dt2, output))
+            case _ =>
+              con(input)(fun(expT(dt, read))(x =>
+                output :=| dt | x))
+          }
+      }
+    }
+
+    E match {
+    case Generate(n, _, f) =>
+      `for`(n, i => acc(f(i))(A `@` i))
+
     case AsScalar(n, m, dt, access, array) =>
       acc(array)(AsScalarAcc(n, m, dt, A))
 
@@ -137,7 +277,7 @@ object AcceptorTranslation {
 
               val isz = n.pow(k - i) * m
               val osz = n.pow(k - i - 1) * m
-              acc(f(osz)(Take(isz, sz - isz, dt, v.rd)))(TakeAcc(osz, sz - osz, dt, v.wr)) `;`
+              acc(f(osz)(Take(isz, sz - isz, dt, read, v.rd)))(TakeAcc(osz, sz - osz, dt, v.wr)) `;`
                 IfThenElse(ip < NatAsIndex(k, Natural(k - 2)), swap, done)
             })
           })
@@ -154,12 +294,55 @@ object AcceptorTranslation {
             streamNext(next, i, fun(expT(dt1, read))(x => fI(x)(A `@` i))))
       ))
 
+    case staticIterate@StaticIterate(_, _, _, _) =>
+      val (n, dt, f, init) = staticIterate.unwrap
+      comment("staticIterate") `;`
+        shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, accumulator =>
+          copyReadInto(dt, init, accumulator.wr) `;`
+            `for`(n, i =>
+              copyReadInto(dt, f(i)(accumulator.rd), accumulator.wr)) `;`
+            copyReadInto(dt, accumulator.rd, A))
+
     case Join(n, m, w, dt, array) =>
       acc(array)(JoinAcc(n, m, dt, A))
+
+    case Take(n, m, dt, access, array) =>
+      def copyPrefix(input: Phrase[ExpType]): Phrase[CommType] =
+        `for`(n, i =>
+          copyReadInto(
+            dt,
+            input `@` NatAsIndex(n + m, IndexAsNat(n, i)),
+            A `@` i))
+
+      access match {
+        case `write` =>
+          acc(array)(PadEmptyAcc(n, m, dt, A))
+        case _ =>
+          con(array)(fun(expT((n + m)`.`dt, read))(copyPrefix))
+      }
+
+    case Drop(n, m, dt, access, array) =>
+      def copySuffix(input: Phrase[ExpType]): Phrase[CommType] =
+        `for`(m, i =>
+          copyReadInto(
+            dt,
+            input `@` NatAsIndex(n + m, IndexAsNat(m, i) + Natural(n)),
+            A `@` i))
+
+      access match {
+        case `write` =>
+          shine.OpenCL.DSL.`new`(AddressSpace.Private)((n + m)`.`dt, tmp =>
+            acc(array)(tmp.wr) `;` copySuffix(tmp.rd))
+        case _ =>
+          con(array)(fun(expT((n + m)`.`dt, read))(copySuffix))
+      }
 
     case Let(dt1, dt2, access, value, f) =>
       con(value)(fun(value.t)(x =>
         acc(f(x))(A)))
+
+    case Materialize(dt, input) =>
+      comment("materialize") `;` copyReadInto(dt, input, A)
 
     case MakeDepPair(a, fst, sndT, snd) =>
       // We have the acceptor already, so simply write the first element and then
@@ -172,14 +355,9 @@ object AcceptorTranslation {
         acc(snd)(pairAcc2(dt1, dt2, A))
 
     case Map(n, dt1, dt2, access, f, array) =>
-      val x = Identifier(freshName("fede_x"), ExpType(dt1, write))
-
-      val otype = AccType(dt2)
-      val o = Identifier(freshName("fede_o"), otype)
-
-      acc(array)(MapAcc(n, dt2, dt1,
-        Lambda(o, fedAcc(scala.Predef.Map((x, o)))(f(x))(fun(otype)(x => x))),
-        A))
+      con(array)(fun(expT(n`.`dt1, read))(x =>
+        `for`(n, i => copyReadInto(dt2, f(x `@` i), A `@` i))
+      ))
 
     case MapFst(w, dt1, dt2, dt3, f, record) =>
       val x = Identifier(freshName("fede_x"), ExpType(dt1, write))
@@ -221,8 +399,7 @@ object AcceptorTranslation {
 
     case reduceSeq@ReduceSeq(unroll) =>
       val (n, dt1, dt2, f, init, array) = reduceSeq.unwrap
-      con(reduceSeq)(fun(expT(dt2, write))(r =>
-        acc(r)(A)))
+      copyReadInto(dt2, reduceSeq, A)
 
     case Reorder(n, dt, access, idxF, idxFinv, input) =>
       acc(input)(ReorderAcc(n, dt, idxFinv, A))
@@ -305,7 +482,7 @@ object AcceptorTranslation {
 
               val isz = n.pow(k - i) * m
               val osz = n.pow(k - i - 1) * m
-              acc(f(osz)(Take(isz, sz - isz, dt, v.rd)))(TakeAcc(osz, sz - osz, dt, v.wr)) `;`
+              acc(f(osz)(Take(isz, sz - isz, dt, read, v.rd)))(TakeAcc(osz, sz - osz, dt, v.wr)) `;`
                 IfThenElse(ip < NatAsIndex(k, Natural(k - 2)), swap, done)
             })
           })
@@ -406,5 +583,6 @@ object AcceptorTranslation {
       }
 
       rec(kc.args, Seq())
+    }
   }
 }

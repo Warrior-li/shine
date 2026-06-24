@@ -205,6 +205,7 @@ object HostManagedBuffers {
       case PairAcc1(_, _, a) => collectWrites(a, writes)
       case PairAcc2(_, _, a) => collectWrites(a, writes)
       case TakeAcc(_, _, _, a) => collectWrites(a, writes)
+      case PadEmptyAcc(_, _, _, a) => collectWrites(a, writes)
       case TransposeAcc(_, _, _, a) => collectWrites(a, writes)
       case _ => throw new Exception(s"did not expect $a")
     }
@@ -257,8 +258,9 @@ object HostManagedBuffers {
           collectReads(_, allocs, reads)
         }
       case NatAsIndex(_, e) => collectReads(e, allocs, reads)
-      case Drop(_, _, _, e) => collectReads(e, allocs, reads)
-      case Take(_, _, _, e) => collectReads(e, allocs, reads)
+      case IndexAsNat(_, e) => collectReads(e, allocs, reads)
+      case Drop(_, _, _, _, e) => collectReads(e, allocs, reads)
+      case Take(_, _, _, _, e) => collectReads(e, allocs, reads)
       case Unzip(_, _, _, _, e) => collectReads(e, allocs, reads)
       case MakePair(_, _, _, e1, e2) =>
         collectReads(e1, allocs, reads); collectReads(e2, allocs, reads)

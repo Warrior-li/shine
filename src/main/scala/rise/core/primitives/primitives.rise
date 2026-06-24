@@ -26,6 +26,7 @@ def natAsIndex: (n: nat) -> natType -> idx[n]
 // memory ops
 def   let: {s: data} -> {t: data} -> s -> (s -> t) -> t
 def toMem: {t: data} -> t -> t
+def materialize: {t: data} -> t -> t
 
 // foreign functions
 def foreignFunction(funDecl: rise.core.ForeignFunction.Decl, n: Int):
@@ -81,6 +82,7 @@ def mapSeqUnroll:  {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -> n.t
 
 def mapStream:     {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -> n.t
 def iterateStream: {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -> n.t
+def staticIterate: (n: nat) -> {t: data} -> (idx[n] -> t -> t) -> t -> t
 
 def mapFst: {s1: data} -> {t: data} -> {s2: data} -> (s1 -> s2) -> (s1, t) -> (s2, t)
 def mapSnd: {s: data} -> {t1: data} -> {t2: data} -> (t1 -> t2) -> (s, t1) -> (s, t2)

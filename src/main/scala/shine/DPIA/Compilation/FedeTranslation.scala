@@ -90,6 +90,12 @@ object FedeTranslation {
           Lambda(o, fedAcc(scala.Predef.Map(x -> o))(f(x))(fun(otype)(x => x))),
           C(y))))
 
+    case Materialize(_, input) =>
+      fedAcc(env)(input)(C)
+
+    case StaticIterate(_, _, _, _) =>
+      ???
+
     case PadEmpty(n, r, dt, array) =>
       fedAcc(env)(array)(fun(accT(C.t.inT.dataType))(o =>
         TakeAcc(n, r, dt, C(o))))

@@ -262,6 +262,9 @@ class KernelCodeGenerator(override val decls: CCodeGenerator.Declarations,
       import BinaryOperator._
       import UnaryOperator._
 
+      if (a == AddressSpace.Private)
+        return codeGenOpenCLPrivateNewDoubleBuffer(dt, in, out, ps, p, env)
+
       val ve = Identifier(s"${ps.name}_e", ps.t.t1.t1.t1)
       val va = Identifier(s"${ps.name}_a", ps.t.t1.t1.t2)
       val done = Identifier(s"${ps.name}_swap", ps.t.t1.t2)
@@ -301,6 +304,93 @@ class KernelCodeGenerator(override val decls: CCodeGenerator.Declarations,
                 ExprStmt(Assignment(in_ptr, TernaryExpr(flag, tmp1, tmp2))),
                 out |> acc(env, CIntExpr(0) :: Nil, o =>
                   ExprStmt(Assignment(out_ptr, UnaryExpr(&, o))))
+              ))
+            })
+          )
+      ))
+    }
+
+    private def codeGenOpenCLPrivateNewDoubleBuffer(
+      dt: ArrayType,
+      in: Phrase[ExpType],
+      out: Phrase[AccType],
+      ps: Identifier[VarType x CommType x CommType],
+      p: Phrase[CommType],
+      env: Environment
+    ): Stmt = {
+      import C.AST._
+      import BinaryOperator._
+      import UnaryOperator._
+
+      val ve = Identifier(s"${ps.name}_e", ps.t.t1.t1.t1)
+      val va = Identifier(s"${ps.name}_a", ps.t.t1.t1.t2)
+      val done = Identifier(s"${ps.name}_swap", ps.t.t1.t2)
+      val swap = Identifier(s"${ps.name}_done", ps.t.t2)
+
+      val tmp1 = DeclRef(freshName("tmp1_"))
+      val tmp2 = DeclRef(freshName("tmp2_"))
+      val in_ptr = DeclRef(freshName("in_ptr_"))
+      val out_ptr = DeclRef(freshName("out_ptr_"))
+      val flag = DeclRef(freshName("flag_"))
+
+      def forBuffer(
+        n: Nat,
+        prefix: String
+      )(body: (KernelCodeGenerator, CIntExpr, DeclRef) => C.AST.Stmt): C.AST.Stmt = {
+        val cI = DeclRef(freshName(prefix))
+        val range = RangeAdd(0, n, 1)
+        val updatedGen = updatedRanges(cI.name, range)
+        ForLoop(
+          DeclStmt(VarDecl(cI.name, Type.int, init = Some(ArithmeticExpr(0)))),
+          BinaryExpr(cI, <, ArithmeticExpr(n)),
+          Assignment(cI, ArithmeticExpr(NamedVar(cI.name, range) + 1)),
+          Block(immutable.Seq(body(updatedGen, CIntExpr(NamedVar(cI.name, range)), cI))))
+      }
+
+      val copyInputToTmp1 =
+        forBuffer(dt.size, "i_") { (gen, iPath, iRef) =>
+          in |> gen.exp(env, iPath :: Nil, e =>
+            ExprStmt(Assignment(ArraySubscript(tmp1, iRef), e)))
+        }
+
+      val outSize = out.t.dataType match {
+        case rise.core.types.DataType.ArrayType(n, _) => n
+        case _ => dt.size
+      }
+
+      def copyCurrentOutPtrToOutput: C.AST.Stmt =
+        forBuffer(outSize, "i_") { (gen, iPath, iRef) =>
+          out |> gen.acc(env, iPath :: Nil, o =>
+            ExprStmt(Assignment(o, ArraySubscript(out_ptr, iRef))))
+        }
+
+      Block(immutable.Seq(
+        // Private double buffering cannot point at global input/output in
+        // OpenCL. Materialize the input into a private buffer and copy the
+        // current private result to the acceptor on each done transition.
+        DeclStmt(OpenCL.AST.VarDecl(tmp1.name, typ(dt), AddressSpace.Private)),
+        DeclStmt(OpenCL.AST.VarDecl(tmp2.name, typ(dt), AddressSpace.Private)),
+        copyInputToTmp1,
+        makePointerDecl(in_ptr.name, AddressSpace.Private, dt.elemType, tmp1),
+        makePointerDecl(out_ptr.name, AddressSpace.Private, dt.elemType, tmp2),
+        DeclStmt(VarDecl(flag.name, Type.uchar, Some(Literal("1")))),
+        Phrase.substitute(
+          PhrasePair(
+            PhrasePair(
+              PhrasePair(ve, va), swap), done), `for` = ps, `in` = p) |>
+          cmd(env updatedIdentEnv (ve -> in_ptr) updatedIdentEnv (va -> out_ptr)
+            updatedCommEnv (swap -> {
+              Block(immutable.Seq(
+                ExprStmt(Assignment(in_ptr, TernaryExpr(flag, tmp2, tmp1))),
+                ExprStmt(Assignment(out_ptr, TernaryExpr(flag, tmp1, tmp2))),
+                ExprStmt(Assignment(flag, BinaryExpr(flag, ^, Literal("1"))))
+              ))
+            })
+            updatedCommEnv (done -> {
+              Block(immutable.Seq(
+                copyCurrentOutPtrToOutput,
+                ExprStmt(Assignment(in_ptr, TernaryExpr(flag, tmp2, tmp1))),
+                ExprStmt(Assignment(out_ptr, TernaryExpr(flag, tmp1, tmp2)))
               ))
             })
           )

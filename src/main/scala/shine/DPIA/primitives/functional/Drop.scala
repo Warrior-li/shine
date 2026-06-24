@@ -9,11 +9,11 @@ import rise.core.types.{ FunType => _, DepFunType => _, TypePlaceholder => _, Ty
 import rise.core.types.DataType._
 import rise.core.types.Kind.{ Identifier => _, _ }
 import shine.DPIA._
-final case class Drop(val n: Nat, val m: Nat, val dt: DataType, val array: Phrase[ExpType]) extends ExpPrimitive {
+final case class Drop(val n: Nat, val m: Nat, val dt: DataType, val a: Access, val array: Phrase[ExpType]) extends ExpPrimitive {
   assert {
-    array :: expT(ArrayType(n + m, dt), read)
+    array :: expT(ArrayType(n + m, dt), a)
     true
   }
-  override val t: ExpType = expT(ArrayType(m, dt), read)
-  override def visitAndRebuild(v: VisitAndRebuild.Visitor): Drop = new Drop(v.nat(n), v.nat(m), v.data(dt), VisitAndRebuild(array, v))
+  override val t: ExpType = expT(ArrayType(m, dt), a)
+  override def visitAndRebuild(v: VisitAndRebuild.Visitor): Drop = new Drop(v.nat(n), v.nat(m), v.data(dt), v.access(a), VisitAndRebuild(array, v))
 }
