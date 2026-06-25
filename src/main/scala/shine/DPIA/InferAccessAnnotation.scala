@@ -271,7 +271,8 @@ private class InferAccessAnnotation {
            | rocup.mapWarp(_) | rocup.mapLane(_) |rompp.mapPar()
            | rp.mapSeq() | rp.mapSeqUnroll() | rp.iterateStream() => p.t match {
         case ((s: DataType) ->: (t: DataType)) ->: (n`.`_) ->: (_`.`_) =>
-          (expT(s, read) ->: expT(t, write)) ->:
+          val ai = accessTypeIdentifier()
+          (expT(s, read) ->: expT(t, ai)) ->:
             expT(n`.`s, read) ->: expT(n`.`t, write)
         case _ => error()
       }

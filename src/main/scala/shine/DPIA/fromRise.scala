@@ -259,11 +259,11 @@ object fromRise {
       }
 
       case core.mapSeq() => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             MapSeq(unroll = false)(n, s, t, f, e)))
       }
@@ -279,11 +279,11 @@ object fromRise {
       }
 
       case core.iterateStream() => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             IterateStream(n, s, t, f, e)))
       }
@@ -303,51 +303,51 @@ object fromRise {
       }
 
       case core.mapSeqUnroll() => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             MapSeq(unroll = true)(n, s, t, f, e)))
       }
 
       case romp.mapPar() => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             omp.MapPar(n, s, t, f, e)))
       }
 
       case rocl.mapGlobal(dim) => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             ocl.Map(Global, dim)(n, s, t, f, e)))
       }
 
       case rocl.mapLocal(dim) => fromType {
-        case ( expT(s, `read`) ->: expT(t, `write`) ) ->:
+        case ( expT(s, `read`) ->: expT(t, ai) ) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+        fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
           fun[ExpType](expT(n`.`s, read), e =>
             ocl.Map(Local, dim)(n, s, t, f, e)))
       }
 
       case rocl.mapWorkGroup(dim) => fromType {
-        case (expT(s, `read`) ->: expT(t, `write`)) ->:
+        case (expT(s, `read`) ->: expT(t, ai)) ->:
           expT(ArrayType(n, _), `read`) ->:
           expT(ArrayType(_, _), `write`)
         =>
-          fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, write), f =>
+          fun[ExpType ->: ExpType](expT(s, read) ->: expT(t, ai), f =>
             fun[ExpType](expT(n `.` s, read), e =>
               ocl.Map(WorkGroup, dim)(n, s, t, f, e)))
       }
