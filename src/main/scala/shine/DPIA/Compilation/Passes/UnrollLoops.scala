@@ -10,12 +10,19 @@ import shine.DPIA.primitives.imperative._
 import shine.OpenCL.primitives.imperative.ParFor
 
 object UnrollLoops {
+  private val defaultMaxStaticUnrollIterations = 1
+
+  private def maxStaticUnrollIterations: Int =
+    sys.props
+      .get("shine.unroll.maxStaticIterations")
+      .flatMap(s => scala.util.Try(s.toInt).toOption)
+      .getOrElse(defaultMaxStaticUnrollIterations)
 
   def unroll: Phrase[CommType] => Phrase[CommType] = p => {
     val r = VisitAndRebuild(p, new VisitAndRebuild.Visitor {
       override def phrase[T <: PhraseType](p: Phrase[T]): Result[Phrase[T]] =
         p match {
-          case f@For(true) =>
+          case f@For(true) if shouldUnroll(f.n, init = 0, step = 1) =>
             f.loopBody match {
               case shine.DPIA.Phrases.Lambda(x, body) =>
                 Continue(unrollLoop(f.n, init = 0, step = 1, i =>
@@ -23,14 +30,18 @@ object UnrollLoops {
                     `for` = x, in = body)), this)
               case _ => throw new Exception("This should not happen")
             }
-          case f@ForNat(true) =>
+          case f@For(true) =>
+            Continue(For(unroll = false)(f.n, f.loopBody), this)
+          case f@ForNat(true) if shouldUnroll(f.n, init = 0, step = 1) =>
             f.loopBody match {
               case shine.DPIA.Phrases.DepLambda(kind, x, body) =>
                 Continue(unrollLoop(f.n, init = 0, step = 1, i =>
                   shine.DPIA.Types.substitute(i, `for` = x, in = body)), this)
               case _ => throw new Exception("This should not happen")
             }
-          case pf@ParFor(_, _, true, _) =>
+          case f@ForNat(true) =>
+            Continue(ForNat(unroll = false)(f.n, f.loopBody), this)
+          case pf@ParFor(_, _, true, _) if shouldUnroll(pf.n, pf.init, pf.step) =>
             pf.body match {
               case shine.DPIA.Phrases.Lambda(ident, shine.DPIA.Phrases.Lambda(identOut, body)) =>
                 pf.out.t.dataType match {
@@ -47,6 +58,9 @@ object UnrollLoops {
                 }
               case _ => throw new Exception("This should not happen")
             }
+          case pf@ParFor(level, dim, true, name) =>
+            Continue(ParFor(level, dim, unroll = false, name)(
+              pf.init, pf.n, pf.step, pf.dt, pf.out, pf.body), this)
           case _ =>
             Continue(p, this)
         }
@@ -54,8 +68,10 @@ object UnrollLoops {
     r
   }
 
-  private def unrollLoop(n: Nat, init: Nat, step: Nat,
-                         genBody: Nat => Phrase[CommType]): Phrase[CommType] = {
+  private def shouldUnroll(n: Nat, init: Nat, step: Nat): Boolean =
+    numIterations(n, init, step) <= maxStaticUnrollIterations
+
+  private def numIterations(n: Nat, init: Nat, step: Nat): Int = {
     import arithexpr.arithmetic.NotEvaluableException
 
     val stopMax = try {
@@ -79,7 +95,20 @@ object UnrollLoops {
         throw new Exception(s"cannot evaluate $step during loop unrolling")
     }
 
-    val numIter = ceilDiv(stopMax - startMin, incr)
+    ceilDiv(stopMax - startMin, incr)
+  }
+
+  private def unrollLoop(n: Nat, init: Nat, step: Nat,
+                         genBody: Nat => Phrase[CommType]): Phrase[CommType] = {
+    import arithexpr.arithmetic.NotEvaluableException
+
+    val numIter = numIterations(n, init, step)
+    val incr = try {
+      step.eval
+    } catch {
+      case _: NotEvaluableException =>
+        throw new Exception(s"cannot evaluate $step during loop unrolling")
+    }
 
     val tmp = (0 until numIter).foldLeft[Phrase[CommType]](
       shine.DPIA.DSL.comment(s"unrolling loop of $numIter"))({
