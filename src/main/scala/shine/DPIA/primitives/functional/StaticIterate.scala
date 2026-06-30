@@ -5,6 +5,7 @@ package shine.DPIA.primitives.functional
 import arithexpr.arithmetic._
 import shine.DPIA.Phrases._
 import shine.DPIA.Types._
+import shine.DPIA.Types.TypeCheck._
 import rise.core.types.{ FunType => _, DepFunType => _, TypePlaceholder => _, TypeIdentifier => _, ExprType => _, _ }
 import rise.core.types.DataType._
 import rise.core.types.Kind.{ Identifier => _, _ }
@@ -12,7 +13,14 @@ import shine.DPIA._
 
 final case class StaticIterate(val n: Nat, val dt: DataType, val f: Phrase[FunType[ExpType, FunType[ExpType, ExpType]]], val init: Phrase[ExpType]) extends ExpPrimitive {
   assert {
-    f :: FunType(expT(IndexType(n), read), FunType(expT(dt, read), expT(dt, read)))
+    typeAssert(
+      (f checkTypeEqOrSubtype
+        FunType(expT(IndexType(n), read), FunType(expT(dt, read), expT(dt, read)))
+      ) || (f checkTypeEqOrSubtype
+        FunType(expT(IndexType(n), read), FunType(expT(dt, read), expT(dt, write)))
+      ),
+      s"staticIterate step has incompatible type ${f.t}"
+    )
     init :: expT(dt, read)
     true
   }

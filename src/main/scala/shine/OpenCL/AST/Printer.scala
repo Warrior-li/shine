@@ -144,10 +144,16 @@ class Printer extends shine.C.AST.CPrinter {
     val VectorType(m, dt, _) = vl.t
     print(s"(${typeName(dt)}$m)")
     print("(")
-    printExpr(vl.values.head, parenthesize = false)
-    for (v <- vl.values.tail) {
-      print(", ")
-      printExpr(v, parenthesize = false)
+    vl.values match {
+      case head +: tail if tail.forall(_ == head) =>
+        printExpr(head, parenthesize = false)
+      case head +: tail =>
+        printExpr(head, parenthesize = false)
+        for (v <- tail) {
+          print(", ")
+          printExpr(v, parenthesize = false)
+        }
+      case _ =>
     }
     print(")")
   }

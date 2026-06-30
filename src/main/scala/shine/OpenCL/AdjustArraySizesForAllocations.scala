@@ -62,6 +62,12 @@ object AdjustArraySizesForAllocations {
       case DepApply(_, f, _) => visitAndGatherInformation(f, parallInfo)
       case DepLambda(_, _, p) => visitAndGatherInformation(p, parallInfo)
       case Idx(_, _, _, p) => visitAndGatherInformation(p, parallInfo)
+      // Proj1/Proj2 are read/write views of the same lexical variable.  They
+      // do not introduce an OpenCL placement level; continue through the
+      // underlying phrase so aggregate private accumulators can be used as
+      // reduction initializers without being rejected by this placement pass.
+      case Proj1(p) => visitAndGatherInformation(p, parallInfo)
+      case Proj2(p) => visitAndGatherInformation(p, parallInfo)
       case Fst(_, _, p) => visitAndGatherInformation(p, parallInfo) match {
         case Nil => Nil
         case RecordInfo(fst, _) :: Nil => fst
@@ -107,6 +113,7 @@ object AdjustArraySizesForAllocations {
       // TODO: think more about these two, what about the indices?
       case Gather(_, _, _, indices, a) => visitAndGatherInformation(a, parallInfo)
       case Scatter(_, _, _, indices, a) => visitAndGatherInformation(a, parallInfo)
+      case ProjectWrite(_, _, _, _, indices, a) => visitAndGatherInformation(a, parallInfo)
 
       case pattern => throw new Exception(s"this should not happen for now: $pattern")
     }

@@ -112,8 +112,9 @@ object FlagPrivateArrayLoops {
           case i: Identifier[_] =>
             idents += i.name
             return Stop(p) // do not visit the type
-          case NatAsIndex(_, p) =>
-            return Continue(p, this)
+          case nai@NatAsIndex(_, e) =>
+            VisitAndRebuild(e, this)
+            return Stop(nai)
           case _ =>
         }
         Continue(p, this)

@@ -19,6 +19,25 @@ import shine.cuda.primitives.{functional => cuda}
 import shine.cuda.primitives.{imperative => cudaIm}
 
 object ContinuationTranslation {
+  private def withPrivateReadAcc(
+    dt: DataType
+  )(
+    body: (Phrase[ExpType], Phrase[AccType]) => Phrase[CommType]
+  )(implicit context: TranslationContext): Phrase[CommType] =
+    dt match {
+      case PairType(dt1, dt2) =>
+        withPrivateReadAcc(dt1) { (rd1, wr1) =>
+          withPrivateReadAcc(dt2) { (rd2, wr2) =>
+            body(
+              MakePair(dt1, dt2, read, rd1, rd2),
+              PairAcc(dt1, dt2, wr1, wr2))
+          }
+        }
+      case _ =>
+        shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, tmp =>
+          body(tmp.rd, tmp.wr))
+    }
+
   def con(E: Phrase[ExpType])
          (C: Phrase[ExpType ->: CommType])
          (implicit context: TranslationContext): Phrase[CommType] = {
@@ -70,15 +89,15 @@ object ContinuationTranslation {
                (implicit context: TranslationContext): Phrase[CommType] = E match {
     case AsScalar(n, m, dt, access, array) =>
       con(array)(fun(array.t)(x =>
-        C(AsScalar(n, m, dt, access, x))))
+        C(AsScalar(n, m, dt, read, x))))
 
     case AsVector(n, m, dt, access, array) =>
       con(array)(fun(array.t)(x =>
-        C(AsVector(n, m, dt, access, x))))
+        C(AsVector(n, m, dt, read, x))))
 
-    case AsVectorAligned(n, m, w, dt, array) =>
+    case AsVectorAligned(n, m, dt, access, array) =>
       con(array)(fun(array.t)(x =>
-        C(AsVectorAligned(n, m, w, dt, x)) ))
+        C(AsVectorAligned(n, m, dt, read, x)) ))
 
     case Cast(dt1, dt2, e) =>
       con(e)(fun(e.t)(x =>
@@ -190,7 +209,7 @@ object ContinuationTranslation {
 
     case Join(n, m, w, dt, array) =>
       con(array)(fun(expT(n`.`(m`.`dt), read))(x =>
-        C(Join(n, m, w, dt, x))))
+        C(Join(n, m, read, dt, x))))
 
     case Let(dt1, dt2, access, value, f) =>
       con(value)(fun(value.t)(x =>
@@ -298,7 +317,7 @@ object ContinuationTranslation {
 
     case Reorder(n, dt, access, idxF, idxFinv, input) =>
       con(input)(fun(expT(n`.`dt, read))(x =>
-        C(Reorder(n, dt, access, idxF, idxFinv, x))))
+        C(Reorder(n, dt, read, idxF, idxFinv, x))))
 
     case scanSeq@ScanSeq(n, dt1, dt2, f, init, array) =>
       `new`(n`.`dt2, fun(varT(n`.`dt2))(tmp =>
@@ -315,7 +334,7 @@ object ContinuationTranslation {
 
     case Split(n, m, w, dt, array) =>
       con(array)(fun(expT((m * n)`.`dt, read))(x =>
-        C(Split(n, m, w, dt, x))))
+        C(Split(n, m, read, dt, x))))
 
     case Take(n, m, dt, access, array) =>
       con(array)(fun(expT((n + m)`.`dt, read))(x =>
@@ -326,7 +345,7 @@ object ContinuationTranslation {
 
     case Transpose(n, m, dt, access, array) =>
       con(array)(fun(array.t)(x =>
-        C(Transpose(n, m, dt, access, x))))
+        C(Transpose(n, m, dt, read, x))))
 
     case TransposeDepArray(n, m, f, array) =>
       con(array)(fun(expT(n`.`(m`.d`f), read))(x =>
@@ -334,7 +353,7 @@ object ContinuationTranslation {
 
     case Unzip(n, dt1, dt2, access, e) =>
       con(e)(fun(expT(n`.`(dt1 x dt2), read))(x =>
-        C(Unzip(n, dt1, dt2, access, x))))
+        C(Unzip(n, dt1, dt2, read, x))))
 
     case VectorFromScalar(n, dt, arg) =>
       con(arg)(fun(expT(dt, read))(e =>
@@ -343,7 +362,7 @@ object ContinuationTranslation {
     case Zip(n, dt1, dt2, access, e1, e2) =>
       con(e1)(fun(expT(n`.`dt1, read))(x =>
         con(e2)(fun(expT(n`.`dt2, read))(y =>
-          C(Zip(n, dt1, dt2, access, x, y)) )) ))
+          C(Zip(n, dt1, dt2, read, x, y)) )) ))
 
     // OpenMP
     case depMapPar@omp.DepMapPar(n, ft1, ft2, f, array) =>
@@ -371,8 +390,8 @@ object ContinuationTranslation {
     case map@ocl.Map(level, dim) =>
       println("WARNING: map loop continuation translation allocates memory")
       // TODO should be removed
-      `new`(map.n `.` map.dt2, fun(varT(map.n `.` map.dt2))(tmp =>
-        acc(map)(tmp.wr) `;` C(tmp.rd)))
+      shine.OpenCL.DSL.`new`(AddressSpace.Private)(map.n `.` map.dt2, tmp =>
+        acc(map)(tmp.wr) `;` C(tmp.rd))
 
     case fc@ocl.OpenCLFunctionCall(name, n) =>
       def rec(ts: Seq[(Phrase[ExpType], DataType)],
@@ -396,17 +415,47 @@ object ContinuationTranslation {
 
       con(array)(fun(expT(n`.`dt1, read))(X => {
         val adj = AdjustArraySizesForAllocations(init, dt2, a)
+        val needsLocalFence = a != AddressSpace.Private
+        val beforeReduce =
+          if (needsLocalFence) shine.OpenCL.DSL.barrier(local = true, global = false)
+          else Skip()
+        val afterReduce =
+          if (needsLocalFence) shine.OpenCL.DSL.barrier(local = true, global = false)
+          else Skip()
 
         comment("oclReduceSeq") `;`
-        shine.OpenCL.DSL.barrier(local = true, global = false) `;`
+        beforeReduce `;`
         (shine.OpenCL.DSL.`new` (a) (adj.dt, accumulator =>
           acc(init)(adj.accF(accumulator.wr)) `;`
             `for`(unroll, n, i =>
               acc( f(adj.exprF(accumulator.rd))(X `@` i) )(adj.accF(accumulator.wr)) ) `;`
             C(adj.exprF(accumulator.rd))
         )) `;`
-        shine.OpenCL.DSL.barrier(local = true, global = false)
+        afterReduce
       }))
+
+    case grouped@ocl.GroupedReduceSeq(_, _, m, dt, _, _) =>
+      shine.OpenCL.DSL.`new`(AddressSpace.Private)(m`.`dt, tmp =>
+        acc(grouped)(tmp.wr) `;` C(tmp.rd))
+
+    case grouped@ocl.GroupedReduceSeqInitAggregate(_, _, _, _, outDt, _, _, _) =>
+      withPrivateReadAcc(outDt) { (rd, wr) =>
+        acc(grouped)(wr) `;` C(rd)
+      }
+
+    case grouped@ocl.GroupedReducePrivateSeqInitAggregate(_, _, _, _, outDt, _, _, _) =>
+      withPrivateReadAcc(outDt) { (rd, wr) =>
+        acc(grouped)(wr) `;` C(rd)
+      }
+
+    case grouped@ocl.GroupedReduceSeqNested(_, _, m, dt, _, _) =>
+      shine.OpenCL.DSL.`new`(AddressSpace.Private)(m`.`dt, tmp =>
+        acc(grouped)(tmp.wr) `;` C(tmp.rd))
+
+    case grouped@ocl.GroupedReduceSeqInitAggregateNested(_, _, _, _, outDt, _, _, _) =>
+      withPrivateReadAcc(outDt) { (rd, wr) =>
+        acc(grouped)(wr) `;` C(rd)
+      }
 
     case ocl.ToMem(addrSpace, dt, input) =>
       val adj = AdjustArraySizesForAllocations(input, dt, addrSpace)

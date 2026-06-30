@@ -8,14 +8,14 @@ import rise.core._
 import rise.core.types._
 import rise.core.types.DataType._
 import arithexpr.arithmetic._
-object staticIterate extends Builder {
+object projectWrite extends Builder {
   private final case class Primitive()(override val t: ExprType = TypePlaceholder) extends rise.core.Primitive {
-    override val name: String = "staticIterate"
+    override val name: String = "projectWrite"
     override def setType(ty: ExprType): Primitive = Primitive()(ty)
     override def primEq(obj: rise.core.Primitive): Boolean = obj.getClass == getClass
-    override def typeScheme: ExprType = expl { (n: Nat) => impl { (t: DataType) => (IndexType(n) ->: t ->: t) ->: t ->: t } }
+    override def typeScheme: ExprType = impl { (n: Nat) => impl { (m: Nat) => impl { (t: DataType) => ArrayType(n, IndexType(m)) ->: ArrayType(n, t) ->: ArrayType(m, t) } } }
   }
-  override def toString: String = "staticIterate"
+  override def toString: String = "projectWrite"
   override def primitive: rise.core.Primitive = Primitive()()
   override def apply: ToBeTyped[rise.core.Primitive] = toBeTyped(Primitive()())
   override def unapply(arg: Expr): Boolean = arg match {

@@ -7,6 +7,21 @@ def oclReduceSeqUnroll: (a: address) -> {n: nat} -> {s: data} -> {t: data} -> (t
 def oclIterate: (a: address) -> {n: nat} -> {m: nat} -> (k: nat) -> {t: data} ->
     ((l: nat) -> (l*n).t -> l.t) -> (m*(n^k)).t -> m.t
 
+def oclGroupedReduceSeq: (a: address) -> (n: nat) -> (m: nat) -> {t: data} ->
+    (t -> t -> t) -> (m*n).t -> m.t
+
+def oclGroupedReduceSeqInitAggregate: (a: address) -> (n: nat) -> (m: nat) -> {t: data} -> {u: data} ->
+    (t -> t -> t) -> u -> (m*n).t -> u
+
+def oclGroupedReducePrivateSeqInitAggregate: (a: address) -> (n: nat) -> (m: nat) -> {t: data} -> {u: data} ->
+    (t -> t -> t) -> u -> (idx[m*n] -> t) -> u
+
+def oclGroupedReduceSeqNested: (a: address) -> (n: nat) -> (m: nat) -> {t: data} ->
+    (t -> t -> t) -> m.n.t -> m.t
+
+def oclGroupedReduceSeqInitAggregateNested: (a: address) -> (n: nat) -> (m: nat) -> {t: data} -> {u: data} ->
+    (t -> t -> t) -> u -> m.n.t -> u
+
 // TODO: should return a stream / sequential array, not an array
 def oclCircularBuffer: (a: address) -> {n: nat} -> (alloc: nat) -> (sz: nat) -> {s: data} -> {t: data} ->
     (s -> t) ->  // function to load an input
@@ -22,6 +37,8 @@ def mapGlobal(dim: Int): {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -
 def mapLocal(dim: Int): {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -> n.t
 
 def mapWorkGroup(dim: Int): {n: nat} -> {s: data} -> {t: data} -> (s -> t) -> n.s -> n.t
+
+def localOwner: {t: data} -> t -> t
 
 def oclRunPrimitive: (ls1: nat) -> (ls2: nat) -> (ls3: nat) -> // the local sizes for execution
     (gs1: nat) -> (gs2: nat) -> (gs3: nat) -> //  the global sizes for execution

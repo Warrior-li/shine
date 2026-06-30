@@ -267,15 +267,22 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
 
     case ScatterAcc(n, m, _, y, a) => path match {
       case (i: CIntExpr) :: ps =>
-        val id = NatIdentifier(freshName("i"))
         Idx(n, IndexType(m), functional.NatAsIndex(n, Natural(i)), y) |>
-          exp(env, Nil, yic => {
-            C.AST.Block(immutable.Seq(
-              C.AST.DeclStmt(C.AST.VarDecl(
-                id.name, C.AST.Type.int, Some(yic)
-              )),
-              a |> acc(env, CIntExpr(id) :: ps, cont)
-            ))
+          exp(env, Nil, {
+            case C.AST.Literal(text) =>
+              a |> acc(env, CIntExpr(Cst(text.toInt)) :: ps, cont)
+            case C.AST.DeclRef(name) =>
+              a |> acc(env, CIntExpr(NamedVar(name, ranges(name))) :: ps, cont)
+            case C.AST.ArithmeticExpr(ae) =>
+              a |> acc(env, CIntExpr(ae) :: ps, cont)
+            case yic =>
+              val id = NatIdentifier(freshName("i"))
+              C.AST.Block(immutable.Seq(
+                C.AST.DeclStmt(C.AST.VarDecl(
+                  id.name, C.AST.Type.int, Some(yic)
+                )),
+                a |> acc(env, CIntExpr(id) :: ps, cont)
+              ))
           })
       case _ => error(s"Expected a C-Integer-Expression on the path.")
     }
@@ -515,7 +522,31 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
       case (i: CIntExpr) :: ps => try {
         m.elements(i.eval) |> exp(env, ps, cont)
       } catch {
-        case NotEvaluableException() => error(s"could not evaluate $i")
+        case NotEvaluableException() =>
+          genNat(i.num, env, idx => {
+            def select(elemIdx: Int)(k: Expr => Stmt): Stmt =
+              if (elemIdx == m.elements.length - 1) {
+                m.elements(elemIdx) |> exp(env, Nil, k)
+              } else {
+                m.elements(elemIdx) |> exp(env, Nil, elem =>
+                  select(elemIdx + 1)(tail =>
+                    k(C.AST.TernaryExpr(
+                      C.AST.BinaryExpr(
+                        idx,
+                        C.AST.BinaryOperator.==,
+                        C.AST.Literal(elemIdx.toString)),
+                      elem,
+                      tail))))
+              }
+
+            select(0)(selected =>
+              generateAccess(
+                m.dt,
+                selected,
+                ps,
+                env,
+                cont))
+          })
       }
       case _ => error(s"did not expect $path")
     }
@@ -1010,6 +1041,7 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
         case GT => C.AST.BinaryOperator.>
         case LT => C.AST.BinaryOperator.<
         case EQ => C.AST.BinaryOperator.==
+        case AND => C.AST.BinaryOperator.&&
       }
     }
 

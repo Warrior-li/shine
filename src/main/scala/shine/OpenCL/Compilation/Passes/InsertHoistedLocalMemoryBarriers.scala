@@ -55,8 +55,23 @@ object InsertHoistedLocalMemoryBarriers {
   private def localBarrier: Phrase[CommType] =
     OpenCL.DSL.barrier(local = true, global = false)
 
+  private def isLocalBarrier(p: Phrase[CommType]): Boolean =
+    p match {
+      case ocl.Barrier(true, false) => true
+      case _ => false
+    }
+
   private def sequence(a: Phrase[CommType], b: Phrase[CommType]): Phrase[CommType] =
-    Seq(a, b)
+    (a, b) match {
+      case (left, right) if isLocalBarrier(left) && isLocalBarrier(right) =>
+        left
+      case (Seq(prefix, left), right) if isLocalBarrier(left) && isLocalBarrier(right) =>
+        Seq(prefix, left)
+      case (left, Seq(right, suffix)) if isLocalBarrier(left) && isLocalBarrier(right) =>
+        Seq(left, suffix)
+      case _ =>
+        Seq(a, b)
+    }
 
   private def withLoopCarriedBarrier(body: Phrase[CommType], effects: Effects): Phrase[CommType] =
     if (effects.hasLocalReuse) {
@@ -87,13 +102,7 @@ object InsertHoistedLocalMemoryBarriers {
             val (body2, effects) = transformCommand(body, localNames)
             val guardedBody = withLoopCarriedBarrier(body2, effects)
             val rebuilt = For(unroll)(f.n, Lambda(x, guardedBody))
-            val guarded =
-              if (effects.touchesLocal) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -103,13 +112,7 @@ object InsertHoistedLocalMemoryBarriers {
             val (body2, effects) = transformCommand(body, localNames)
             val guardedBody = withLoopCarriedBarrier(body2, effects)
             val rebuilt = ForNat(unroll)(f.n, DepLambda(NatKind, x, guardedBody))
-            val guarded =
-              if (effects.touchesLocal) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -119,13 +122,7 @@ object InsertHoistedLocalMemoryBarriers {
             val (body2, effects) = transformCommand(body, localNames)
             val guardedBody = withLoopCarriedBarrier(body2, effects)
             val rebuilt = ForVec(fv.n, fv.dt, fv.out, Lambda(x, Lambda(o, guardedBody)))
-            val guarded =
-              if (effects.touchesLocal) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -134,13 +131,7 @@ object InsertHoistedLocalMemoryBarriers {
           case Lambda(x, body) =>
             val (body2, effects) = transformCommand(body, localNames)
             val rebuilt = New(n.dt, Lambda(x, body2))
-            val guarded =
-              if (effects.touchesLocal) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -149,13 +140,7 @@ object InsertHoistedLocalMemoryBarriers {
           case Lambda(x, body) =>
             val (body2, effects) = transformCommand(body, localNames)
             val rebuilt = ocl.New(n.a, n.dt, Lambda(x, body2))
-            val guarded =
-              if (effects.touchesLocal) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -168,13 +153,7 @@ object InsertHoistedLocalMemoryBarriers {
             val effects = bodyEffects ++ outputEffects
             val rebuilt = ocl.ParFor(level, dim, unroll, name)(pf.init, pf.n, pf.step, pf.dt, pf.out,
               Lambda(x, Lambda(o, body2)))
-            val guarded =
-              if (level == Local) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -187,13 +166,7 @@ object InsertHoistedLocalMemoryBarriers {
             val effects = bodyEffects ++ outputEffects
             val rebuilt = ocl.ParForNat(level, dim, unroll, name)(pf.init, pf.n, pf.step, pf.ft, pf.out,
               DepLambda(NatKind, i, Lambda(o, body2)))
-            val guarded =
-              if (level == Local) {
-                sequence(localBarrier, sequence(rebuilt, localBarrier))
-              } else {
-                rebuilt
-              }
-            (guarded, effects)
+            (rebuilt, effects)
           case _ => throw new Exception("This should not happen")
         }
 
@@ -202,13 +175,10 @@ object InsertHoistedLocalMemoryBarriers {
           reads = collectReads(rhs, localNames),
           writes = collectWrites(lhs, localNames)
         )
-        val guarded =
-          if (effects.reads.nonEmpty) {
-            sequence(localBarrier, sequence(p, localBarrier))
-          } else {
-            p
-          }
-        (guarded, effects)
+        (p, effects)
+
+      case Skip() | Comment(_) | ocl.Barrier(_, _) =>
+        (p, Effects())
 
       case _ =>
         (p, Effects(reads = localNames, writes = localNames))

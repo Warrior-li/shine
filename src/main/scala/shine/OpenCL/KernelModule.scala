@@ -18,10 +18,11 @@ object KernelModule {
 
   def translationToString(m: KernelModule): String = {
     m.codeOverride().getOrElse {
-    s"""
-       |${m.decls.map(OpenCL.AST.Printer(_)).mkString("\n")}
-       |
-       |${m.kernels.map(k => OpenCL.AST.Printer(k.code)).mkString("\n")}
-       |""".stripMargin
-  }}
+      val decls = m.decls.map(OpenCL.AST.Printer(_)).filter(_.nonEmpty)
+      val kernels = m.kernels.map(k => OpenCL.AST.Printer(k.code)).filter(_.nonEmpty)
+      Seq(decls.mkString("\n"), kernels.mkString("\n"))
+        .filter(_.nonEmpty)
+        .mkString("\n\n")
+    }
+  }
 }

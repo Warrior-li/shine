@@ -291,15 +291,20 @@ object fromRise {
       case core.staticIterate() => fromType {
         case nFunT(n,
           (expT(IndexType(_), `read`) ->:
-            (expT(t1, `read`) ->: expT(t2, `read`))) ->:
+            (expT(t1, `read`) ->: expT(t2, ai))) ->:
           expT(t3, `read`) ->:
           expT(t4, `read`))
         =>
         depFun(NatKind, n)(
           fun[ExpType ->: ExpType ->: ExpType](
-            expT(IndexType(n), read) ->: (expT(t1, read) ->: expT(t2, read)),
+            expT(IndexType(n), read) ->: (expT(t1, read) ->: expT(t2, ai)),
             f => fun[ExpType](expT(t3, read), init =>
               StaticIterate(n, t4, f, init))))
+      }
+
+      case rocl.localOwner() => fromType {
+        case expT(t, `read`) ->: expT(_, `write`) =>
+          fun[ExpType](expT(t, read), e => LocalOwner(t, e))
       }
 
       case core.mapSeqUnroll() => fromType {
@@ -568,6 +573,16 @@ object fromRise {
               Scatter(n, m, t, y, x)))
       }
 
+      case core.projectWrite() => fromType {
+        case expT(ArrayType(n, IndexType(m)), `read`) ->:
+          expT(ArrayType(_, t), a) ->:
+          expT(ArrayType(_, _), `write`)
+        =>
+          fun[ExpType](expT(n`.`idx(m), read), y =>
+            fun[ExpType](expT(n`.`t, a), x =>
+              ProjectWrite(n, m, t, a, y, x)))
+      }
+
       case core.transpose() => fromType {
         case expT(ArrayType(n, ArrayType(m, t)), a) ->:
           expT(ArrayType(_, ArrayType(_, _)), _)
@@ -713,6 +728,14 @@ object fromRise {
         case expT(`bool`, `read`) ->: expT(`bool`, `read`)
         =>
         fun[ExpType](expT(bool, read), e => UnaryOp(Operators.Unary.NOT, e))
+      }
+
+      case core.and() => fromType {
+        case expT(`bool`, `read`) ->: expT(`bool`, `read`) ->: expT(`bool`, `read`)
+        =>
+        fun[ExpType](expT(bool, read), e1 =>
+          fun[ExpType](expT(bool, read), e2 =>
+            BinOp(Operators.Binary.AND, e1, e2)))
       }
 
       case core.add() => fromType {
@@ -866,6 +889,77 @@ object fromRise {
             l ->: (expT(ln`.`t, read) ->: expT(l`.`t, write)), f =>
               fun[ExpType](expT(insz`.`t, read), e =>
                 ocl.Iterate(a, ln /^ l, m, k, t, f, e)))))
+      }
+
+      case rocl.oclGroupedReduceSeq() => fromType {
+        case aFunT(a, nFunT(n, nFunT(m,
+          (expT(t1, `read`) ->: (expT(_, `read`) ->: expT(_, `read`))) ->:
+          expT(_`.`_, `read`) ->:
+          expT(_`.`_, `read`) )))
+        =>
+        depFun(AddressSpaceKind, a)(depFun(NatKind, n)(depFun(NatKind, m)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(t1, read) ->: (expT(t1, read) ->: expT(t1, read)), f =>
+              fun[ExpType](expT((m * n)`.`t1, read), e =>
+                ocl.GroupedReduceSeq(a, n, m, t1, f, e))))))
+      }
+
+      case rocl.oclGroupedReduceSeqInitAggregate() => fromType {
+        case aFunT(a, nFunT(n, nFunT(m,
+          (expT(t1, `read`) ->: (expT(_, `read`) ->: expT(_, `read`))) ->:
+          expT(outT, `read`) ->:
+          expT(_`.`_, `read`) ->:
+          expT(_, `read`) )))
+        =>
+        depFun(AddressSpaceKind, a)(depFun(NatKind, n)(depFun(NatKind, m)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(t1, read) ->: (expT(t1, read) ->: expT(t1, read)), f =>
+              fun[ExpType](expT(outT, read), init =>
+              fun[ExpType](expT((m * n)`.`t1, read), e =>
+                  ocl.GroupedReduceSeqInitAggregate(a, n, m, t1, outT, f, init, e)))))))
+      }
+
+      case rocl.oclGroupedReducePrivateSeqInitAggregate() => fromType {
+        case aFunT(a, nFunT(n, nFunT(m,
+          (expT(t1, `read`) ->: (expT(_, `read`) ->: expT(_, `read`))) ->:
+          expT(outT, `read`) ->:
+          (expT(_, `read`) ->: expT(_, `read`)) ->:
+          expT(_, `read`) )))
+        =>
+        depFun(AddressSpaceKind, a)(depFun(NatKind, n)(depFun(NatKind, m)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(t1, read) ->: (expT(t1, read) ->: expT(t1, read)), f =>
+              fun[ExpType](expT(outT, read), init =>
+                fun[ExpType ->: ExpType](expT(IndexType(m * n), read) ->: expT(t1, read), e =>
+                  ocl.GroupedReducePrivateSeqInitAggregate(a, n, m, t1, outT, f, init, e)))))))
+      }
+
+      case rocl.oclGroupedReduceSeqNested() => fromType {
+        case aFunT(a, nFunT(n, nFunT(m,
+          (expT(t1, `read`) ->: (expT(_, `read`) ->: expT(_, `read`))) ->:
+          expT(_, `read`) ->:
+          expT(_`.`_, `read`) )))
+        =>
+        depFun(AddressSpaceKind, a)(depFun(NatKind, n)(depFun(NatKind, m)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(t1, read) ->: (expT(t1, read) ->: expT(t1, read)), f =>
+              fun[ExpType](expT(m`.`(n`.`t1), read), e =>
+                ocl.GroupedReduceSeqNested(a, n, m, t1, f, e))))))
+      }
+
+      case rocl.oclGroupedReduceSeqInitAggregateNested() => fromType {
+        case aFunT(a, nFunT(n, nFunT(m,
+          (expT(t1, `read`) ->: (expT(_, `read`) ->: expT(_, `read`))) ->:
+          expT(outT, `read`) ->:
+          expT(_, `read`) ->:
+          expT(_, `read`) )))
+        =>
+        depFun(AddressSpaceKind, a)(depFun(NatKind, n)(depFun(NatKind, m)(
+          fun[ExpType ->: ExpType ->: ExpType](
+            expT(t1, read) ->: (expT(t1, read) ->: expT(t1, read)), f =>
+              fun[ExpType](expT(outT, read), init =>
+                fun[ExpType](expT(m`.`(n`.`t1), read), e =>
+                  ocl.GroupedReduceSeqInitAggregateNested(a, n, m, t1, outT, f, init, e)))))))
       }
 
       case core.asVector() => fromType {

@@ -14,6 +14,7 @@ import shine.DPIA._
 import shine.DPIA.primitives.functional._
 import shine.DPIA.primitives.imperative.{Seq => _, _}
 import shine.OpenCL.AdjustArraySizesForAllocations
+import shine.OpenCL.get_local_id
 import shine.OpenMP.primitives.{functional => omp}
 import shine.OpenCL.primitives.{functional => ocl}
 import shine.OpenCL.primitives.{imperative => oclImp}
@@ -21,9 +22,45 @@ import shine.cuda.primitives.{functional => cuda}
 import shine.cuda.primitives.{imperative => cudaImp}
 
 object AcceptorTranslation {
+  private def readLeaves(dt: DataType, input: Phrase[ExpType]): Seq[Phrase[ExpType]] =
+    dt match {
+      case ArrayType(Cst(n), elemT) =>
+        (0 until n.toInt).flatMap(i => readLeaves(elemT, input `@` Cst(i)))
+      case PairType(dt1, dt2) =>
+        readLeaves(dt1, Fst(dt1, dt2, input)) ++
+          readLeaves(dt2, Snd(dt1, dt2, input))
+      case _ =>
+        Seq(input)
+    }
+
+  private def accLeaves(dt: DataType, output: Phrase[AccType]): Seq[Phrase[AccType]] =
+    dt match {
+      case ArrayType(Cst(n), elemT) =>
+        (0 until n.toInt).flatMap(i => accLeaves(elemT, output `@` Cst(i)))
+      case PairType(dt1, dt2) =>
+        accLeaves(dt1, pairAcc1(dt1, dt2, output)) ++
+          accLeaves(dt2, pairAcc2(dt1, dt2, output))
+      case _ =>
+        Seq(output)
+    }
+
   def acc(E: Phrase[ExpType])
          (A: Phrase[AccType])
          (implicit context: TranslationContext): Phrase[CommType] = {
+    def copyReadValueInto(
+      dt: DataType,
+      input: Phrase[ExpType],
+      output: Phrase[AccType]
+    ): Phrase[CommType] = dt match {
+      case ArrayType(n, elemT) =>
+        `for`(n, i => copyReadValueInto(elemT, input `@` i, output `@` i))
+      case PairType(dt1, dt2) =>
+        copyReadValueInto(dt1, Fst(dt1, dt2, input), pairAcc1(dt1, dt2, output)) `;`
+          copyReadValueInto(dt2, Snd(dt1, dt2, input), pairAcc2(dt1, dt2, output))
+      case _ =>
+        output :=| dt | input
+    }
+
     E match {
       // on the fly beta-reduction
       case Apply(fun, arg) => acc(Lifting.liftFunction(fun).reducing(arg))(A)
@@ -38,6 +75,15 @@ object AcceptorTranslation {
 
       case staticIterate@StaticIterate(_, _, _, _) =>
         primitive(staticIterate)(A)
+
+      case grouped: ocl.GroupedReduceSeqInitAggregate =>
+        primitive(grouped)(A)
+
+      case grouped: ocl.GroupedReducePrivateSeqInitAggregate =>
+        primitive(grouped)(A)
+
+      case grouped: ocl.GroupedReduceSeqInitAggregateNested =>
+        primitive(grouped)(A)
 
       case e
         if TypeCheck.notContainingArrayType(e.t.dataType)
@@ -56,7 +102,7 @@ object AcceptorTranslation {
 
       case c: Literal => A :=|c.t.dataType| c
 
-      case x: Identifier[ExpType] => A :=|x.t.dataType| x
+      case x: Identifier[ExpType] => copyReadValueInto(x.t.dataType, x, A)
 
       case n: Natural => A :=|n.t.dataType| n
 
@@ -125,9 +171,16 @@ object AcceptorTranslation {
       ): Phrase[CommType] =
         con(array)(fun(expT(n`.`dt1, read))(x => {
           val adj = AdjustArraySizesForAllocations(init, dt2, addressSpace)
+          val needsLocalFence = addressSpace != AddressSpace.Private
+          val beforeReduce =
+            if (needsLocalFence) shine.OpenCL.DSL.barrier(local = true, global = false)
+            else Skip()
+          val afterReduce =
+            if (needsLocalFence) shine.OpenCL.DSL.barrier(local = true, global = false)
+            else Skip()
 
           comment("oclReduceSeq materialize") `;`
-            shine.OpenCL.DSL.barrier(local = true, global = false) `;`
+            beforeReduce `;`
             shine.OpenCL.DSL.`new`(addressSpace)(adj.dt, accumulator =>
               copyReadInto(dt2, init, adj.accF(accumulator.wr)) `;`
                 `for`(unroll, n, i =>
@@ -136,7 +189,7 @@ object AcceptorTranslation {
                     f(adj.exprF(accumulator.rd))(x `@` i),
                     adj.accF(accumulator.wr))) `;`
                 copyReadInto(dt2, adj.exprF(accumulator.rd), output)) `;`
-            shine.OpenCL.DSL.barrier(local = true, global = false)
+            afterReduce
         }))
 
       def destinationPassingStaticIterate(
@@ -150,7 +203,7 @@ object AcceptorTranslation {
           shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, accumulator =>
             copyReadInto(dt, init, accumulator.wr) `;`
               `for`(n, i =>
-                copyReadInto(dt, f(i)(accumulator.rd), accumulator.wr)) `;`
+                acc(f(i)(accumulator.rd))(accumulator.wr)) `;`
               copyReadInto(dt, accumulator.rd, output))
 
       input match {
@@ -205,6 +258,9 @@ object AcceptorTranslation {
           val (n, dt, f, init) = staticIterate.unwrap
           destinationPassingStaticIterate(n, dt, f, init, output)
 
+        case LocalOwner(_, inner) =>
+          `if`(localOwnerCondition) `then` copyReadInto(dt, inner, output) `else` Skip()
+
         case _ =>
           dt match {
             case ArrayType(n, elemT) =>
@@ -212,8 +268,10 @@ object AcceptorTranslation {
                 `for`(n, i => copyReadInto(elemT, x `@` i, output `@` i))
               ))
             case PairType(dt1, dt2) =>
-              copyReadInto(dt1, Fst(dt1, dt2, input), pairAcc1(dt1, dt2, output)) `;`
-                copyReadInto(dt2, Snd(dt1, dt2, input), pairAcc2(dt1, dt2, output))
+              con(input)(fun(expT(dt1 x dt2, read))(x =>
+                copyReadInto(dt1, Fst(dt1, dt2, x), pairAcc1(dt1, dt2, output)) `;`
+                  copyReadInto(dt2, Snd(dt1, dt2, x), pairAcc2(dt1, dt2, output))
+              ))
             case _ =>
               con(input)(fun(expT(dt, read))(x =>
                 output :=| dt | x))
@@ -222,6 +280,14 @@ object AcceptorTranslation {
     }
 
     E match {
+    case makeArray@MakeArray(n) =>
+      val (elemT, elements) = makeArray.unwrap
+      elements.zipWithIndex.foldLeft(
+        comment("makeArray"): Phrase[CommType]) {
+        case (body, (elem, idx)) =>
+          body `;` acc(elem)(A `@` Cst(idx))
+      }
+
     case Generate(n, _, f) =>
       `for`(n, i => acc(f(i))(A `@` i))
 
@@ -300,7 +366,7 @@ object AcceptorTranslation {
         shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, accumulator =>
           copyReadInto(dt, init, accumulator.wr) `;`
             `for`(n, i =>
-              copyReadInto(dt, f(i)(accumulator.rd), accumulator.wr)) `;`
+              acc(f(i)(accumulator.rd))(accumulator.wr)) `;`
             copyReadInto(dt, accumulator.rd, A))
 
     case Join(n, m, w, dt, array) =>
@@ -343,6 +409,9 @@ object AcceptorTranslation {
 
     case Materialize(dt, input) =>
       comment("materialize") `;` copyReadInto(dt, input, A)
+
+    case LocalOwner(_, input) =>
+      `if`(localOwnerCondition) `then` acc(input)(A) `else` Skip()
 
     case MakeDepPair(a, fst, sndT, snd) =>
       // We have the acceptor already, so simply write the first element and then
@@ -419,6 +488,10 @@ object AcceptorTranslation {
       con(indices)(fun(expT(n`.`idx(m), read))(y =>
         acc(input)(ScatterAcc(n, m, dt, y, A))))
 
+    case ProjectWrite(n, m, dt, _, indices, input) =>
+      con(indices)(fun(expT(n`.`idx(m), read))(y =>
+        acc(input)(ScatterAcc(n, m, dt, y, A))))
+
     case slide@Slide(n, sz, sp, dt, input) =>
       con(slide)(fun(expT(n`.`(sz`.`dt), read))(x =>
         A :=|(n`.`(sz`.`dt))| x ))
@@ -485,6 +558,530 @@ object AcceptorTranslation {
               acc(f(osz)(Take(isz, sz - isz, dt, read, v.rd)))(TakeAcc(osz, sz - osz, dt, v.wr)) `;`
                 IfThenElse(ip < NatAsIndex(k, Natural(k - 2)), swap, done)
             })
+          })
+      }))
+
+    case ocl.GroupedReduceSeq(a, n, m, dt, f, input) =>
+      if (a != AddressSpace.Local) {
+        throw new Exception("oclGroupedReduceSeq currently lowers local reductions only")
+      }
+      val lanes = n match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeq needs a static lane count")
+      }
+      if (lanes <= 0 || (lanes & (lanes - 1)) != 0) {
+        throw new Exception("oclGroupedReduceSeq needs a power-of-two lane count")
+      }
+      con(input)(fun(expT((m * n)`.`dt, read))(x => {
+        val total = m * n
+
+        def directCopy(): Phrase[CommType] =
+          `for`(m, group =>
+            copyReadInto(
+              dt,
+              x `@` NatAsIndex(total, IndexAsNat(m, group) * Natural(n)),
+              A `@` group))
+
+        val firstFanIn =
+          if (lanes >= 8) BigInt(8)
+          else if (lanes >= 4) BigInt(4)
+          else BigInt(2)
+        val firstStride = lanes / firstFanIn
+        val scratchLanes = Natural(Cst(firstStride.toLong))
+        val scratchTotal = m * Cst(firstStride.toLong)
+
+        def copyFirstStageInto(
+            leaves: Seq[Phrase[ExpType]],
+            dst: Phrase[AccType]
+        ): Phrase[CommType] = {
+          leaves match {
+            case Seq(one) =>
+              copyReadInto(dt, one, dst)
+            case Seq(lhs, rhs) =>
+              copyReadInto(dt, f(lhs)(rhs), dst)
+            case _ =>
+              val (lhsLeaves, rhsLeaves) = leaves.splitAt(leaves.size / 2)
+              shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, lhs =>
+                shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, rhs =>
+                  copyFirstStageInto(lhsLeaves, lhs.wr) `;`
+                    copyFirstStageInto(rhsLeaves, rhs.wr) `;`
+                    copyReadInto(dt, f(lhs.rd)(rhs.rd), dst)))
+          }
+        }
+
+        def firstStage(scratch: Phrase[VarType]): Phrase[CommType] =
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            scratchTotal,
+            dt,
+            scratch.wr,
+            fun(expT(idx(scratchTotal), read))(q => fun(accT(dt))(dst => {
+              val qNat = IndexAsNat(scratchTotal, q)
+              val groupNat = qNat / scratchLanes
+              val laneNat = qNat % scratchLanes
+              val srcNat = (groupNat * Natural(n)) + (laneNat * Natural(Cst(firstFanIn.toLong)))
+              def src(offset: BigInt): Phrase[ExpType] =
+                x `@` NatAsIndex(total, srcNat + Natural(Cst(offset.toLong)))
+              copyFirstStageInto((0 until firstFanIn.toInt).map(i => src(BigInt(i))), dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+
+        def stage(stride: BigInt)(scratch: Phrase[VarType]): Phrase[CommType] = {
+          val strideArith = Cst(stride.toLong)
+          val strideNat = Natural(strideArith)
+          val workItems = m * strideArith
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            workItems,
+            dt,
+            TakeAcc(workItems, scratchTotal - workItems, dt, scratch.wr),
+            fun(expT(idx(workItems), read))(q => fun(accT(dt))(_ => {
+              val qNat = IndexAsNat(workItems, q)
+              val groupNat = qNat / strideNat
+              val laneNat = qNat % strideNat
+              val groupBase = groupNat * scratchLanes
+              val dst = NatAsIndex(scratchTotal, groupBase + laneNat)
+              val srcNat = groupBase + (laneNat * Natural(2))
+              val src0 = NatAsIndex(scratchTotal, srcNat)
+              val src1 = NatAsIndex(scratchTotal, srcNat + Natural(1))
+              copyReadInto(dt, f(scratch.rd `@` src0)(scratch.rd `@` src1), scratch.wr `@` dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+        }
+
+        val strides = Iterator.iterate(firstStride / 2)(_ / 2).takeWhile(_ >= 2).toSeq
+        comment("oclGroupedReduceSeq") `;` (
+          if (lanes == 1) {
+            directCopy()
+          } else {
+            def root(scratch: Phrase[VarType], group: Phrase[ExpType]): Phrase[ExpType] = {
+              val groupBase = IndexAsNat(m, group) * scratchLanes
+              val lhs = scratch.rd `@` NatAsIndex(scratchTotal, groupBase)
+              if (firstStride == 1) {
+                lhs
+              } else {
+                f(lhs)(scratch.rd `@` NatAsIndex(scratchTotal, groupBase + Natural(1)))
+              }
+            }
+            shine.OpenCL.DSL.`new`(AddressSpace.Local)(scratchTotal`.`dt, scratch =>
+              firstStage(scratch) `;`
+                strides.foldLeft(Skip(): Phrase[CommType])((body, stride) =>
+                  body `;` stage(stride)(scratch)) `;`
+                `for`(m, group =>
+                  copyReadInto(dt, root(scratch, group), A `@` group)))
+          })
+      }))
+
+    case ocl.GroupedReduceSeqInitAggregate(a, n, m, dt, outDt, f, init, input) =>
+      if (a != AddressSpace.Local) {
+        throw new Exception("oclGroupedReduceSeqInitAggregate currently lowers local reductions only")
+      }
+      val lanes = n match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeqInitAggregate needs a static lane count")
+      }
+      val groups = m match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeqInitAggregate needs a static group count")
+      }
+      if (lanes <= 0 || (lanes & (lanes - 1)) != 0) {
+        throw new Exception("oclGroupedReduceSeqInitAggregate needs a power-of-two lane count")
+      }
+      val outputLeaves = accLeaves(outDt, A)
+      if (outputLeaves.size != groups.toInt) {
+        throw new Exception(
+          s"oclGroupedReduceSeqInitAggregate expected $groups aggregate leaves, got ${outputLeaves.size}")
+      }
+      val initLeaves = readLeaves(outDt, init)
+      if (initLeaves.size != outputLeaves.size) {
+        throw new Exception(
+          s"oclGroupedReduceSeqInitAggregate init/output leaf mismatch: ${initLeaves.size} vs ${outputLeaves.size}")
+      }
+      con(input)(fun(expT((m * n)`.`dt, read))(x => {
+        val total = m * n
+
+        def writeRoots(root: BigInt => Phrase[ExpType]): Phrase[CommType] =
+          initLeaves.zip(outputLeaves).zipWithIndex.foldLeft(Skip(): Phrase[CommType]) {
+            case (body, ((initLeaf, outputLeaf), group)) =>
+              body `;` copyReadInto(dt, f(initLeaf)(root(BigInt(group))), outputLeaf)
+          }
+
+        val firstFanIn =
+          if (lanes >= 8) BigInt(8)
+          else if (lanes >= 4) BigInt(4)
+          else BigInt(2)
+        val firstStride = lanes / firstFanIn
+        val scratchLanes = Natural(Cst(firstStride.toLong))
+        val scratchTotal = m * Cst(firstStride.toLong)
+
+        def copyFirstStageInto(
+            leaves: Seq[Phrase[ExpType]],
+            dst: Phrase[AccType]
+        ): Phrase[CommType] = {
+          leaves match {
+            case Seq(one) =>
+              copyReadInto(dt, one, dst)
+            case Seq(lhs, rhs) =>
+              copyReadInto(dt, f(lhs)(rhs), dst)
+            case _ =>
+              val (lhsLeaves, rhsLeaves) = leaves.splitAt(leaves.size / 2)
+              shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, lhs =>
+                shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, rhs =>
+                  copyFirstStageInto(lhsLeaves, lhs.wr) `;`
+                    copyFirstStageInto(rhsLeaves, rhs.wr) `;`
+                    copyReadInto(dt, f(lhs.rd)(rhs.rd), dst)))
+          }
+        }
+
+        def firstStage(scratch: Phrase[VarType]): Phrase[CommType] =
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            scratchTotal,
+            dt,
+            scratch.wr,
+            fun(expT(idx(scratchTotal), read))(q => fun(accT(dt))(dst => {
+              val qNat = IndexAsNat(scratchTotal, q)
+              val groupNat = qNat / scratchLanes
+              val laneNat = qNat % scratchLanes
+              val srcNat = (groupNat * Natural(n)) + (laneNat * Natural(Cst(firstFanIn.toLong)))
+              def src(offset: BigInt): Phrase[ExpType] =
+                x `@` NatAsIndex(total, srcNat + Natural(Cst(offset.toLong)))
+              copyFirstStageInto((0 until firstFanIn.toInt).map(i => src(BigInt(i))), dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+
+        def stage(stride: BigInt)(scratch: Phrase[VarType]): Phrase[CommType] = {
+          val strideArith = Cst(stride.toLong)
+          val strideNat = Natural(strideArith)
+          val workItems = m * strideArith
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            workItems,
+            dt,
+            TakeAcc(workItems, scratchTotal - workItems, dt, scratch.wr),
+            fun(expT(idx(workItems), read))(q => fun(accT(dt))(_ => {
+              val qNat = IndexAsNat(workItems, q)
+              val groupNat = qNat / strideNat
+              val laneNat = qNat % strideNat
+              val groupBase = groupNat * scratchLanes
+              val dst = NatAsIndex(scratchTotal, groupBase + laneNat)
+              val srcNat = groupBase + (laneNat * Natural(2))
+              val src0 = NatAsIndex(scratchTotal, srcNat)
+              val src1 = NatAsIndex(scratchTotal, srcNat + Natural(1))
+              copyReadInto(dt, f(scratch.rd `@` src0)(scratch.rd `@` src1), scratch.wr `@` dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+        }
+
+        val strides = Iterator.iterate(firstStride / 2)(_ / 2).takeWhile(_ >= 2).toSeq
+        comment("oclGroupedReduceSeqInitAggregate") `;` (
+          if (lanes == 1) {
+            writeRoots(group =>
+              x `@` NatAsIndex(total, Natural(Cst(group.toLong)) * Natural(n)))
+          } else {
+            def root(scratch: Phrase[VarType], group: BigInt): Phrase[ExpType] = {
+              val groupBase = Natural(Cst(group.toLong)) * scratchLanes
+              val lhs = scratch.rd `@` NatAsIndex(scratchTotal, groupBase)
+              if (firstStride == 1) {
+                lhs
+              } else {
+                f(lhs)(scratch.rd `@` NatAsIndex(scratchTotal, groupBase + Natural(1)))
+              }
+            }
+            shine.OpenCL.DSL.`new`(AddressSpace.Local)(scratchTotal`.`dt, scratch =>
+              firstStage(scratch) `;`
+                strides.foldLeft(Skip(): Phrase[CommType])((body, stride) =>
+                  body `;` stage(stride)(scratch)) `;`
+                writeRoots(group => root(scratch, group)))
+          })
+      }))
+
+    case ocl.GroupedReducePrivateSeqInitAggregate(a, n, m, dt, outDt, f, init, input) =>
+      if (a != AddressSpace.Local) {
+        throw new Exception("oclGroupedReducePrivateSeqInitAggregate currently lowers local reductions only")
+      }
+      val lanes = n match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReducePrivateSeqInitAggregate needs a static lane count")
+      }
+      val groups = m match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReducePrivateSeqInitAggregate needs a static group count")
+      }
+      if (lanes <= 0 || (lanes & (lanes - 1)) != 0) {
+        throw new Exception("oclGroupedReducePrivateSeqInitAggregate needs a power-of-two lane count")
+      }
+      val outputLeaves = accLeaves(outDt, A)
+      if (outputLeaves.size != groups.toInt) {
+        throw new Exception(
+          s"oclGroupedReducePrivateSeqInitAggregate expected $groups aggregate leaves, got ${outputLeaves.size}")
+      }
+      val initLeaves = readLeaves(outDt, init)
+      if (initLeaves.size != outputLeaves.size) {
+        throw new Exception(
+          s"oclGroupedReducePrivateSeqInitAggregate init/output leaf mismatch: ${initLeaves.size} vs ${outputLeaves.size}")
+      }
+      val total = m * n
+
+      def writeRoots(root: BigInt => Phrase[ExpType]): Phrase[CommType] =
+        initLeaves.zip(outputLeaves).zipWithIndex.foldLeft(Skip(): Phrase[CommType]) {
+          case (body, ((initLeaf, outputLeaf), group)) =>
+            body `;` copyReadInto(dt, f(initLeaf)(root(BigInt(group))), outputLeaf)
+        }
+
+      def stage(stride: BigInt)(scratch: Phrase[VarType]): Phrase[CommType] = {
+        val strideArith = Cst(stride.toLong)
+        val strideNat = Natural(strideArith)
+        val workItems = m * strideArith
+        shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+          workItems,
+          dt,
+          TakeAcc(workItems, total - workItems, dt, scratch.wr),
+          fun(expT(idx(workItems), read))(q => fun(accT(dt))(_ => {
+            val qNat = IndexAsNat(workItems, q)
+            val groupNat = qNat / strideNat
+            val laneNat = qNat % strideNat
+            val groupBase = groupNat * Natural(n)
+            val dstNat = groupBase + laneNat
+            val dst = NatAsIndex(total, dstNat)
+            val src = NatAsIndex(total, dstNat + strideNat)
+            copyReadInto(dt, f(scratch.rd `@` dst)(scratch.rd `@` src), scratch.wr `@` dst)
+          }))
+        ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+      }
+
+      val strides = Iterator.iterate(lanes / 2)(_ / 2).takeWhile(_ >= 1).toSeq
+      comment("oclGroupedReducePrivateSeqInitAggregate") `;`
+        shine.OpenCL.DSL.`new`(AddressSpace.Local)(total`.`dt, scratch =>
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            total,
+            dt,
+            scratch.wr,
+            fun(expT(idx(total), read))(q => fun(accT(dt))(dst =>
+              copyReadInto(dt, input(q), dst)))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false) `;`
+            strides.foldLeft(Skip(): Phrase[CommType])((body, stride) =>
+              body `;` stage(stride)(scratch)) `;`
+            writeRoots(group =>
+              scratch.rd `@` NatAsIndex(total, Natural(Cst(group.toLong)) * Natural(n))))
+
+    case ocl.GroupedReduceSeqNested(a, n, m, dt, f, input) =>
+      if (a != AddressSpace.Local) {
+        throw new Exception("oclGroupedReduceSeqNested currently lowers local reductions only")
+      }
+      val lanes = n match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeqNested needs a static lane count")
+      }
+      if (lanes <= 0 || (lanes & (lanes - 1)) != 0) {
+        throw new Exception("oclGroupedReduceSeqNested needs a power-of-two lane count")
+      }
+      con(input)(fun(expT(m`.`(n`.`dt), read))(x => {
+        def directCopy(): Phrase[CommType] =
+          `for`(m, group =>
+            copyReadInto(dt, (x `@` group) `@` NatAsIndex(n, Natural(0)), A `@` group))
+
+        val firstFanIn =
+          if (lanes >= 8) BigInt(8)
+          else if (lanes >= 4) BigInt(4)
+          else BigInt(2)
+        val firstStride = lanes / firstFanIn
+        val scratchLanes = Natural(Cst(firstStride.toLong))
+        val scratchTotal = m * Cst(firstStride.toLong)
+
+        def copyFirstStageInto(
+            leaves: Seq[Phrase[ExpType]],
+            dst: Phrase[AccType]
+        ): Phrase[CommType] = {
+          leaves match {
+            case Seq(one) =>
+              copyReadInto(dt, one, dst)
+            case Seq(lhs, rhs) =>
+              copyReadInto(dt, f(lhs)(rhs), dst)
+            case _ =>
+              val (lhsLeaves, rhsLeaves) = leaves.splitAt(leaves.size / 2)
+              shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, lhs =>
+                shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, rhs =>
+                  copyFirstStageInto(lhsLeaves, lhs.wr) `;`
+                    copyFirstStageInto(rhsLeaves, rhs.wr) `;`
+                    copyReadInto(dt, f(lhs.rd)(rhs.rd), dst)))
+          }
+        }
+
+        def firstStage(scratch: Phrase[VarType]): Phrase[CommType] =
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            scratchTotal,
+            dt,
+            scratch.wr,
+            fun(expT(idx(scratchTotal), read))(q => fun(accT(dt))(dst => {
+              val qNat = IndexAsNat(scratchTotal, q)
+              val groupNat = qNat / scratchLanes
+              val laneNat = qNat % scratchLanes
+              val group = NatAsIndex(m, groupNat)
+              def src(offset: BigInt): Phrase[ExpType] =
+                (x `@` group) `@` NatAsIndex(n, (laneNat * Natural(Cst(firstFanIn.toLong))) + Natural(Cst(offset.toLong)))
+              copyFirstStageInto((0 until firstFanIn.toInt).map(i => src(BigInt(i))), dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+
+        def stage(stride: BigInt)(scratch: Phrase[VarType]): Phrase[CommType] = {
+          val strideArith = Cst(stride.toLong)
+          val strideNat = Natural(strideArith)
+          val workItems = m * strideArith
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            workItems,
+            dt,
+            TakeAcc(workItems, scratchTotal - workItems, dt, scratch.wr),
+            fun(expT(idx(workItems), read))(q => fun(accT(dt))(_ => {
+              val qNat = IndexAsNat(workItems, q)
+              val groupNat = qNat / strideNat
+              val laneNat = qNat % strideNat
+              val groupBase = groupNat * scratchLanes
+              val dst = NatAsIndex(scratchTotal, groupBase + laneNat)
+              val srcNat = groupBase + (laneNat * Natural(2))
+              val src0 = NatAsIndex(scratchTotal, srcNat)
+              val src1 = NatAsIndex(scratchTotal, srcNat + Natural(1))
+              copyReadInto(dt, f(scratch.rd `@` src0)(scratch.rd `@` src1), scratch.wr `@` dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+        }
+
+        val strides = Iterator.iterate(firstStride / 2)(_ / 2).takeWhile(_ >= 2).toSeq
+        comment("oclGroupedReduceSeqNested") `;` (
+          if (lanes == 1) {
+            directCopy()
+          } else {
+            def root(scratch: Phrase[VarType], group: Phrase[ExpType]): Phrase[ExpType] = {
+              val groupBase = IndexAsNat(m, group) * scratchLanes
+              val lhs = scratch.rd `@` NatAsIndex(scratchTotal, groupBase)
+              if (firstStride == 1) {
+                lhs
+              } else {
+                f(lhs)(scratch.rd `@` NatAsIndex(scratchTotal, groupBase + Natural(1)))
+              }
+            }
+            shine.OpenCL.DSL.`new`(AddressSpace.Local)(scratchTotal`.`dt, scratch =>
+              firstStage(scratch) `;`
+                strides.foldLeft(Skip(): Phrase[CommType])((body, stride) =>
+                  body `;` stage(stride)(scratch)) `;`
+                `for`(m, group =>
+                  copyReadInto(dt, root(scratch, group), A `@` group)))
+          })
+      }))
+
+    case ocl.GroupedReduceSeqInitAggregateNested(a, n, m, dt, outDt, f, init, input) =>
+      if (a != AddressSpace.Local) {
+        throw new Exception("oclGroupedReduceSeqInitAggregateNested currently lowers local reductions only")
+      }
+      val lanes = n match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeqInitAggregateNested needs a static lane count")
+      }
+      val groups = m match {
+        case Cst(value) => BigInt(value)
+        case _ => throw new Exception("oclGroupedReduceSeqInitAggregateNested needs a static group count")
+      }
+      if (lanes <= 0 || (lanes & (lanes - 1)) != 0) {
+        throw new Exception("oclGroupedReduceSeqInitAggregateNested needs a power-of-two lane count")
+      }
+      val outputLeaves = accLeaves(outDt, A)
+      if (outputLeaves.size != groups.toInt) {
+        throw new Exception(
+          s"oclGroupedReduceSeqInitAggregateNested expected $groups aggregate leaves, got ${outputLeaves.size}")
+      }
+      val initLeaves = readLeaves(outDt, init)
+      if (initLeaves.size != outputLeaves.size) {
+        throw new Exception(
+          s"oclGroupedReduceSeqInitAggregateNested init/output leaf mismatch: ${initLeaves.size} vs ${outputLeaves.size}")
+      }
+      con(input)(fun(expT(m`.`(n`.`dt), read))(x => {
+        def writeRoots(root: BigInt => Phrase[ExpType]): Phrase[CommType] =
+          initLeaves.zip(outputLeaves).zipWithIndex.foldLeft(Skip(): Phrase[CommType]) {
+            case (body, ((initLeaf, outputLeaf), group)) =>
+              body `;` copyReadInto(dt, f(initLeaf)(root(BigInt(group))), outputLeaf)
+          }
+
+        val firstFanIn =
+          if (lanes >= 8) BigInt(8)
+          else if (lanes >= 4) BigInt(4)
+          else BigInt(2)
+        val firstStride = lanes / firstFanIn
+        val scratchLanes = Natural(Cst(firstStride.toLong))
+        val scratchTotal = m * Cst(firstStride.toLong)
+
+        def copyFirstStageInto(
+            leaves: Seq[Phrase[ExpType]],
+            dst: Phrase[AccType]
+        ): Phrase[CommType] = {
+          leaves match {
+            case Seq(one) =>
+              copyReadInto(dt, one, dst)
+            case Seq(lhs, rhs) =>
+              copyReadInto(dt, f(lhs)(rhs), dst)
+            case _ =>
+              val (lhsLeaves, rhsLeaves) = leaves.splitAt(leaves.size / 2)
+              shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, lhs =>
+                shine.OpenCL.DSL.`new`(AddressSpace.Private)(dt, rhs =>
+                  copyFirstStageInto(lhsLeaves, lhs.wr) `;`
+                    copyFirstStageInto(rhsLeaves, rhs.wr) `;`
+                    copyReadInto(dt, f(lhs.rd)(rhs.rd), dst)))
+          }
+        }
+
+        def firstStage(scratch: Phrase[VarType]): Phrase[CommType] =
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            scratchTotal,
+            dt,
+            scratch.wr,
+            fun(expT(idx(scratchTotal), read))(q => fun(accT(dt))(dst => {
+              val qNat = IndexAsNat(scratchTotal, q)
+              val groupNat = qNat / scratchLanes
+              val laneNat = qNat % scratchLanes
+              val group = NatAsIndex(m, groupNat)
+              def src(offset: BigInt): Phrase[ExpType] =
+                (x `@` group) `@` NatAsIndex(n, (laneNat * Natural(Cst(firstFanIn.toLong))) + Natural(Cst(offset.toLong)))
+              copyFirstStageInto((0 until firstFanIn.toInt).map(i => src(BigInt(i))), dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+
+        def stage(stride: BigInt)(scratch: Phrase[VarType]): Phrase[CommType] = {
+          val strideArith = Cst(stride.toLong)
+          val strideNat = Natural(strideArith)
+          val workItems = m * strideArith
+          shine.OpenCL.DSL.parFor(shine.OpenCL.Local, 0, unroll = false)(
+            workItems,
+            dt,
+            TakeAcc(workItems, scratchTotal - workItems, dt, scratch.wr),
+            fun(expT(idx(workItems), read))(q => fun(accT(dt))(_ => {
+              val qNat = IndexAsNat(workItems, q)
+              val groupNat = qNat / strideNat
+              val laneNat = qNat % strideNat
+              val groupBase = groupNat * scratchLanes
+              val dst = NatAsIndex(scratchTotal, groupBase + laneNat)
+              val srcNat = groupBase + (laneNat * Natural(2))
+              val src0 = NatAsIndex(scratchTotal, srcNat)
+              val src1 = NatAsIndex(scratchTotal, srcNat + Natural(1))
+              copyReadInto(dt, f(scratch.rd `@` src0)(scratch.rd `@` src1), scratch.wr `@` dst)
+            }))
+          ) `;` shine.OpenCL.DSL.barrier(local = true, global = false)
+        }
+
+        val strides = Iterator.iterate(firstStride / 2)(_ / 2).takeWhile(_ >= 2).toSeq
+        comment("oclGroupedReduceSeqInitAggregateNested") `;` (
+          if (lanes == 1) {
+            writeRoots(group =>
+              (x `@` NatAsIndex(m, Natural(Cst(group.toLong)))) `@` NatAsIndex(n, Natural(0)))
+          } else {
+            def root(scratch: Phrase[VarType], group: BigInt): Phrase[ExpType] = {
+              val groupBase = Natural(Cst(group.toLong)) * scratchLanes
+              val lhs = scratch.rd `@` NatAsIndex(scratchTotal, groupBase)
+              if (firstStride == 1) {
+                lhs
+              } else {
+                f(lhs)(scratch.rd `@` NatAsIndex(scratchTotal, groupBase + Natural(1)))
+              }
+            }
+            shine.OpenCL.DSL.`new`(AddressSpace.Local)(scratchTotal`.`dt, scratch =>
+              firstStage(scratch) `;`
+                strides.foldLeft(Skip(): Phrase[CommType])((body, stride) =>
+                  body `;` stage(stride)(scratch)) `;`
+                writeRoots(group => root(scratch, group)))
           })
       }))
 
@@ -584,5 +1181,14 @@ object AcceptorTranslation {
 
       rec(kc.args, Seq())
     }
+  }
+
+  private def localOwnerCondition: Phrase[ExpType] = {
+    def isZero(dim: Int): Phrase[ExpType] =
+      BinOp(Operators.Binary.EQ, Natural(get_local_id(dim)), Natural(0))
+
+    BinOp(Operators.Binary.AND,
+      BinOp(Operators.Binary.AND, isZero(0), isZero(1)),
+      isZero(2))
   }
 }

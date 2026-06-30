@@ -69,7 +69,11 @@ object UnrollLoops {
   }
 
   private def shouldUnroll(n: Nat, init: Nat, step: Nat): Boolean =
-    numIterations(n, init, step) <= maxStaticUnrollIterations
+    try {
+      numIterations(n, init, step) <= maxStaticUnrollIterations
+    } catch {
+      case _: arithexpr.arithmetic.NotEvaluableException => false
+    }
 
   private def numIterations(n: Nat, init: Nat, step: Nat): Int = {
     import arithexpr.arithmetic.NotEvaluableException
@@ -77,22 +81,22 @@ object UnrollLoops {
     val stopMax = try {
       n.max.eval
     } catch {
-      case _: NotEvaluableException =>
-        throw new Exception(s"cannot evaluate ${n.max} during loop unrolling")
+      case e: NotEvaluableException =>
+        throw e
     }
 
     val startMin = try {
       init.min.eval
     } catch {
-      case _: NotEvaluableException =>
-        throw new Exception(s"cannot evaluate ${init.min} during loop unrolling")
+      case e: NotEvaluableException =>
+        throw e
     }
 
     val incr = try {
       step.eval
     } catch {
-      case _: NotEvaluableException =>
-        throw new Exception(s"cannot evaluate $step during loop unrolling")
+      case e: NotEvaluableException =>
+        throw e
     }
 
     ceilDiv(stopMax - startMin, incr)

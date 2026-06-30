@@ -39,6 +39,18 @@ trait Printer {
       if (sb.last.isWhitespace) { sb.deleteCharAt(sb.size - 1) }
     }
   }
+
+  protected def cursorAtLineStart: Boolean = {
+    var i = sb.length - 1
+    while (i >= 0 && sb.charAt(i) == ' ') { i -= 1 }
+    i >= 0 && sb.charAt(i) == '\n'
+  }
+
+  protected def endStatementLine(): Unit = {
+    if (!cursorAtLineStart) {
+      println("")
+    }
+  }
 }
 
 object Printer {
@@ -206,7 +218,7 @@ class CPrinter extends Printer {
   // Smts
   private def printStmts(s: Stmts): Unit = {
     printStmt(s.fst)
-    println("")
+    endStatementLine()
     printStmt(s.snd)
   }
 
@@ -215,7 +227,7 @@ class CPrinter extends Printer {
     println("{")
     b.body.foreach( (s: Stmt) => {
       printStmt(s)
-      println("")
+      endStatementLine()
     })
     indent -= 1
     moveCursorBack(tabSize)
@@ -228,9 +240,50 @@ class CPrinter extends Printer {
     print(" ")
     printExpr(f.cond, parenthesize = false)
     print("; ")
-    printExpr(f.increment, parenthesize = false)
+    printForIncrement(f.increment)
     print(") ")
     printBlock(f.body)
+  }
+
+  private def printForIncrement(e: Expr): Unit = e match {
+    case Assignment(DeclRef(name), ArithmeticExpr(Sum(terms)))
+      if isUnitIncrement(name, terms) =>
+      print(s"$name++")
+    case Assignment(DeclRef(name), ArithmeticExpr(ae))
+      if isPrintedUnitIncrement(name, ae) =>
+      print(s"$name++")
+    case Assignment(DeclRef(name), _)
+      if renderedUnitIncrement(name, e) =>
+      print(s"$name++")
+    case _ =>
+      printExpr(e, parenthesize = false)
+  }
+
+  private def isUnitIncrement(name: String, terms: Iterable[ArithExpr]): Boolean = {
+    var seenOne = false
+    var seenSelf = false
+    var count = 0
+    terms.foreach {
+      case Cst(1) if !seenOne =>
+        seenOne = true
+        count += 1
+      case v: Var if !seenSelf && v.toString == name =>
+        seenSelf = true
+        count += 1
+      case _ =>
+        count += 1
+    }
+    count == 2 && seenOne && seenSelf
+  }
+
+  private def isPrintedUnitIncrement(name: String, ae: ArithExpr): Boolean = {
+    val rhs = printArithExpr(ae, parenthesize = false)
+    rhs == s"1 + $name" || rhs == s"$name + 1"
+  }
+
+  private def renderedUnitIncrement(name: String, e: Expr): Boolean = {
+    val rendered = (new CPrinter).printNode(e)
+    rendered == s"$name = 1 + $name" || rendered == s"$name = $name + 1"
   }
 
   private def printWhileLoop(w: WhileLoop): Unit = {
@@ -241,15 +294,20 @@ class CPrinter extends Printer {
   }
 
   private def printIfThenElse(i: shine.C.AST.IfThenElse): Unit = {
+    def printBranch(s: Stmt): Unit = s match {
+      case b: Block => printBlock(b)
+      case other => printBlock(Block(Seq(other)))
+    }
+
     print("if (")
     printExpr(i.cond, parenthesize = false)
     print(") ")
-    printStmt(i.trueBody)
+    printBranch(i.trueBody)
 
     i.falseBody match {
       case Some(falseBody) =>
         print(" else ")
-        printStmt(falseBody)
+        printBranch(falseBody)
       case None =>
     }
   }

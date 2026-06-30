@@ -267,8 +267,8 @@ class KernelCodeGenerator(override val decls: CCodeGenerator.Declarations,
 
       val ve = Identifier(s"${ps.name}_e", ps.t.t1.t1.t1)
       val va = Identifier(s"${ps.name}_a", ps.t.t1.t1.t2)
-      val done = Identifier(s"${ps.name}_swap", ps.t.t1.t2)
-      val swap = Identifier(s"${ps.name}_done", ps.t.t2)
+      val swap = Identifier(s"${ps.name}_swap", ps.t.t1.t2)
+      val done = Identifier(s"${ps.name}_done", ps.t.t2)
 
       val tmp1 = DeclRef(freshName("tmp1_"))
       val tmp2 = DeclRef(freshName("tmp2_"))
@@ -431,13 +431,17 @@ class KernelCodeGenerator(override val decls: CCodeGenerator.Declarations,
           case Cst(0) => C.AST.Comment("iteration count is 0, no loop emitted")
           // iteration count is 1 => no loop
           case Cst(1) =>
-            C.AST.Stmts(C.AST.Stmts(
+            val body = p |> updatedGen.cmd(env)
+            val header = C.AST.Stmts(
               C.AST.Comment("iteration count is exactly 1, no loop emitted"),
               C.AST.DeclStmt(
                 C.AST.VarDecl(
                   cI.name, C.AST.Type.int,
-                  init = Some(C.AST.ArithmeticExpr(f.init))))),
-              p |> updatedGen.cmd(env))
+                  init = Some(C.AST.ArithmeticExpr(f.init)))))
+            if (f.level == shine.OpenCL.Local)
+              C.AST.Stmts(header, C.AST.IfThenElse(cond, body, None))
+            else
+              C.AST.Stmts(header, body)
             /* FIXME?
           case _ if (range.start.min.min == Cst(0) && range.stop == Cst(1)) ||
                     (range.numVals.min == NegInf

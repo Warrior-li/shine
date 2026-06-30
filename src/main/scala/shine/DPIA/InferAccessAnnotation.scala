@@ -325,14 +325,21 @@ private class InferAccessAnnotation {
         case _ => error()
       }
 
+      case roclp.localOwner() => p.t match {
+        case (t: DataType) ->: (_: DataType) =>
+          expT(t, read) ->: expT(t, write)
+        case _ => error()
+      }
+
       case rp.staticIterate() => p.t match {
         case n `(Nat)->:`
              ((IndexType(_) ->: ((dt1: DataType) ->: (dt2: DataType))) ->:
              (dt3: DataType) ->:
              (dt4: DataType)) =>
+          val ai = accessTypeIdentifier()
           nFunT(n,
             (expT(IndexType(n), read) ->:
-              (expT(dt1, read) ->: expT(dt2, read))) ->:
+              (expT(dt1, read) ->: expT(dt2, ai))) ->:
               expT(dt3, read) ->:
               expT(dt4, read))
         case _ => error()
@@ -401,7 +408,7 @@ private class InferAccessAnnotation {
         case _ => error()
       }
 
-      case rp.idx() | rp.add() | rp.sub() | rp.mul() | rp.div() | rp.gt()
+      case rp.idx() | rp.add() | rp.sub() | rp.mul() | rp.div() | rp.and() | rp.gt()
            | rp.lt() | rp.equal() | rp.mod() | rp.gather() => p.t match {
         case (dt1: DataType) ->: (dt2: DataType) ->: (dt3: DataType) =>
           expT(dt1, read) ->: expT(dt2, read) ->: expT(dt3, read)
@@ -411,6 +418,13 @@ private class InferAccessAnnotation {
       case rp.scatter() => p.t match {
         case (dt1: DataType) ->: (dt2: DataType) ->: (dt3: DataType) =>
           expT(dt1, read) ->: expT(dt2, write) ->: expT(dt3, write)
+        case _ => error()
+      }
+
+      case rp.projectWrite() => p.t match {
+        case (dt1: DataType) ->: (dt2: DataType) ->: (dt3: DataType) =>
+          val ai = accessTypeIdentifier()
+          expT(dt1, read) ->: expT(dt2, ai) ->: expT(dt3, write)
         case _ => error()
       }
 
@@ -544,6 +558,78 @@ private class InferAccessAnnotation {
             nFunT(l, expT(at1, read) ->: expT(at2, write)) ->:
               expT(at3, read) ->: expT(at4, write) ))
         case _ => error()
+      }
+
+      case roclp.oclGroupedReduceSeq() => p.t match {
+        case rt.DepFunType(rt.AddressSpaceKind, a: rt.AddressSpaceIdentifier,
+          rt.DepFunType(rt.NatKind, n: rt.NatIdentifier,
+            rt.DepFunType(rt.NatKind, m: rt.NatIdentifier,
+              rt.FunType(
+                rt.FunType(t1: DataType, rt.FunType(t2: DataType, _: DataType)),
+                _: rt.ExprType)))) =>
+          aFunT(a, nFunT(n, nFunT(m,
+            (expT(t1, read) ->: expT(t2, read) ->: expT(t1, read)) ->:
+              expT((n * m)`.`t1, read) ->: expT(m`.`t1, read))))
+        case _ => error(s"unexpected oclGroupedReduceSeq type: ${p.t}")
+      }
+
+      case roclp.oclGroupedReduceSeqInitAggregate() => p.t match {
+        case rt.DepFunType(rt.AddressSpaceKind, a: rt.AddressSpaceIdentifier,
+          rt.DepFunType(rt.NatKind, n: rt.NatIdentifier,
+            rt.DepFunType(rt.NatKind, m: rt.NatIdentifier,
+              rt.FunType(
+                rt.FunType(t1: DataType, rt.FunType(t2: DataType, _: DataType)),
+                rt.FunType(outT: DataType, rt.FunType(_: DataType, _: DataType)))))) =>
+          aFunT(a, nFunT(n, nFunT(m,
+            (expT(t1, read) ->: expT(t2, read) ->: expT(t1, read)) ->:
+              expT(outT, read) ->:
+              expT((n * m)`.`t1, read) ->:
+              expT(outT, read))))
+        case _ => error(s"unexpected oclGroupedReduceSeqInitAggregate type: ${p.t}")
+      }
+
+      case roclp.oclGroupedReducePrivateSeqInitAggregate() => p.t match {
+        case rt.DepFunType(rt.AddressSpaceKind, a: rt.AddressSpaceIdentifier,
+          rt.DepFunType(rt.NatKind, n: rt.NatIdentifier,
+            rt.DepFunType(rt.NatKind, m: rt.NatIdentifier,
+              rt.FunType(
+                rt.FunType(t1: DataType, rt.FunType(t2: DataType, _: DataType)),
+                rt.FunType(outT: DataType,
+                  rt.FunType(rt.FunType(IndexType(_), _: DataType), _: DataType)))))) =>
+          aFunT(a, nFunT(n, nFunT(m,
+            (expT(t1, read) ->: expT(t2, read) ->: expT(t1, read)) ->:
+              expT(outT, read) ->:
+              (expT(IndexType(m * n), read) ->: expT(t1, read)) ->:
+              expT(outT, read))))
+        case _ => error(s"unexpected oclGroupedReducePrivateSeqInitAggregate type: ${p.t}")
+      }
+
+      case roclp.oclGroupedReduceSeqNested() => p.t match {
+        case rt.DepFunType(rt.AddressSpaceKind, a: rt.AddressSpaceIdentifier,
+          rt.DepFunType(rt.NatKind, n: rt.NatIdentifier,
+            rt.DepFunType(rt.NatKind, m: rt.NatIdentifier,
+              rt.FunType(
+                rt.FunType(t1: DataType, rt.FunType(t2: DataType, _: DataType)),
+                _: rt.ExprType)))) =>
+          aFunT(a, nFunT(n, nFunT(m,
+            (expT(t1, read) ->: expT(t2, read) ->: expT(t1, read)) ->:
+              expT(m`.`(n`.`t1), read) ->: expT(m`.`t1, read))))
+        case _ => error(s"unexpected oclGroupedReduceSeqNested type: ${p.t}")
+      }
+
+      case roclp.oclGroupedReduceSeqInitAggregateNested() => p.t match {
+        case rt.DepFunType(rt.AddressSpaceKind, a: rt.AddressSpaceIdentifier,
+          rt.DepFunType(rt.NatKind, n: rt.NatIdentifier,
+            rt.DepFunType(rt.NatKind, m: rt.NatIdentifier,
+              rt.FunType(
+                rt.FunType(t1: DataType, rt.FunType(t2: DataType, _: DataType)),
+                rt.FunType(outT: DataType, rt.FunType(_: DataType, _: DataType)))))) =>
+          aFunT(a, nFunT(n, nFunT(m,
+            (expT(t1, read) ->: expT(t2, read) ->: expT(t1, read)) ->:
+              expT(outT, read) ->:
+              expT(m`.`(n`.`t1), read) ->:
+              expT(outT, read))))
+        case _ => error(s"unexpected oclGroupedReduceSeqInitAggregateNested type: ${p.t}")
       }
 
       case rp.select() => p.t match {

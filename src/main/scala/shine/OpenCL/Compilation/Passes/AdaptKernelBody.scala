@@ -21,11 +21,18 @@ object AdaptKernelBody {
     (unrollPrivateArrays(_)) andThen
       (moveLocalMemoryVariableDeclarations(_))
 
-  // In OpenCL we unroll arrays in private memory
+  // OpenCL permits private arrays.  Older lowering expected every private-array
+  // indexing loop to be unrolled, but some generated tile kernels are smaller
+  // and faster when those loops are left structured.  Keep the diagnostic
+  // opt-in so codegen output is not polluted by stale warnings.
   private object unrollPrivateArrays {
+    private val warnPrivateArrayLoops: Boolean =
+      java.lang.Boolean.getBoolean("shine.opencl.warnPrivateArrayLoops")
+
     def apply(body: C.AST.Block): C.AST.Block = {
-      if (identifyLoopsToUnroll(body).nonEmpty) {
-        println("WARNING: loops that should have been unrolled remain in the OpenCL code")
+      val loopVars = identifyLoopsToUnroll(body)
+      if (warnPrivateArrayLoops && loopVars.nonEmpty) {
+        println(s"INFO: private-array indexed loops remain in the OpenCL code: $loopVars")
       }
       body
     }
@@ -87,10 +94,14 @@ object AdaptKernelBody {
       }
 
       val block = C.AST.Nodes.VisitAndRebuild(body, Visitor)
-      val localVarDecls = localVars.foldLeft[C.AST.Stmt](C.AST.Comment("Start of moved local vars")) { (stmts, v) =>
-        Stmts(stmts, DeclStmt(v))
+      if (localVars.isEmpty) {
+        block
+      } else {
+        val localVarDecls = localVars.foldLeft[C.AST.Stmt](C.AST.Comment("Start of moved local vars")) { (stmts, v) =>
+          Stmts(stmts, DeclStmt(v))
+        }
+        Block(localVarDecls +: C.AST.Comment("End of moved local vars") +: block.body)
       }
-      Block(localVarDecls +: C.AST.Comment("End of moved local vars") +: block.body)
     }
   }
 
