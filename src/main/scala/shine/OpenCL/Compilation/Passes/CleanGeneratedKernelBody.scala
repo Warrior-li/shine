@@ -21,6 +21,7 @@ object CleanGeneratedKernelBody {
   private val MaxSmallLoopUnrollIterations = 8
   private val MaxMergedAccumulatorAssignments = 4
   private val MaxInlineTernaryAssignmentExprSize = 256
+  private val MaxInlineArrayLhsIndexLength = 160
 
   private def withInit(decl: VarDecl, init: Option[Expr]): VarDecl =
     decl match {
@@ -109,7 +110,8 @@ object CleanGeneratedKernelBody {
         branchLhsHoisted
       }
     val finalTernariesSplit = splitLargeTernaryAssignments(branchDecodeReduced)
-    flattenTrivialBlocks(simplifyKnownBranchConditions(finalTernariesSplit))
+    val lhsIndexHoisted = hoistLongArrayAssignmentLhsIndices(finalTernariesSplit)
+    flattenTrivialBlocks(simplifyKnownBranchConditions(lhsIndexHoisted))
   }
 
   private case class BranchFact(value: Boolean, refs: Set[String])
@@ -250,6 +252,79 @@ object CleanGeneratedKernelBody {
       case other =>
         other
     }
+
+  private def hoistLongArrayAssignmentLhsIndices(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        body.foreach(collectDeclNames(_, usedNames))
+        Block(body.flatMap(s => flatten(hoistLongArrayAssignmentLhsIndex(s, usedNames))))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistLongArrayAssignmentLhsIndices(a),
+          hoistLongArrayAssignmentLhsIndices(b))))
+
+      case ForLoop(init, cond, bodyUpdate, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, bodyUpdate,
+          hoistLongArrayAssignmentLhsIndices(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistLongArrayAssignmentLhsIndices(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistLongArrayAssignmentLhsIndices(trueBody),
+          falseBody.map(hoistLongArrayAssignmentLhsIndices))
+
+      case other =>
+        hoistLongArrayAssignmentLhsIndex(
+          other,
+          scala.collection.mutable.Set.empty[String])
+    }
+
+  private def hoistLongArrayAssignmentLhsIndex(
+      stmt: Stmt,
+      usedNames: scala.collection.mutable.Set[String]
+    ): Stmt =
+    stmt match {
+      case ExprStmt(Assignment(ArraySubscript(array, index), rhs))
+          if pure(array) && pure(index) && longInlineArrayIndex(index) =>
+        val tmp = freshName("_np_lhs_idx", usedNames)
+        Block(Seq(
+          DeclStmt(VarDecl(tmp, Type.int, Some(index))),
+          ExprStmt(Assignment(ArraySubscript(array, DeclRef(tmp)), rhs))
+        ))
+
+      case Block(body) =>
+        Block(body.flatMap(s => flatten(hoistLongArrayAssignmentLhsIndex(s, usedNames))))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistLongArrayAssignmentLhsIndex(a, usedNames),
+          hoistLongArrayAssignmentLhsIndex(b, usedNames))))
+
+      case ForLoop(init, cond, bodyUpdate, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, bodyUpdate,
+          hoistLongArrayAssignmentLhsIndex(body, usedNames).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistLongArrayAssignmentLhsIndex(body, usedNames))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistLongArrayAssignmentLhsIndex(trueBody, usedNames),
+          falseBody.map(hoistLongArrayAssignmentLhsIndex(_, usedNames)))
+
+      case other =>
+        other
+    }
+
+  private def longInlineArrayIndex(index: Expr): Boolean =
+    cPrinterKey(index).exists(_.length > MaxInlineArrayLhsIndexLength) ||
+      exprSize(index) > 48
 
   private def hoistCommonBranchAssignmentLhsIndex(
       stmt: Stmt,
