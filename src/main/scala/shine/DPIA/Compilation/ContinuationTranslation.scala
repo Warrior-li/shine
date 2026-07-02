@@ -189,6 +189,19 @@ object ContinuationTranslation {
           fun(expT(dt, read) ->: (comm: CommType))(cont =>
             con(f(i))(fun(expT(dt, read))(g => Apply(cont, g)))))))
 
+    case Idx(n, dt, index, makeArray@MakeArray(_)) =>
+      con(index)(fun(index.t)(i =>
+        C(Idx(n, dt, i, makeArray))))
+
+    case Idx(total, dt, index, Join(n, m, _, _, array)) =>
+      con(index)(fun(index.t)(i => {
+        val iNat = IndexAsNat(total, i)
+        val outer = NatAsIndex(n, iNat / Natural(m))
+        val inner = NatAsIndex(m, iNat % Natural(m))
+        con(Idx(n, m`.`dt, outer, array))(fun(expT(m`.`dt, read))(row =>
+          C(Idx(m, dt, inner, row))))
+      }))
+
     case Idx(n, dt, index, array) =>
       con(array)(fun(expT(n`.`dt, read))(e =>
         con(index)(fun(index.t)(i =>
@@ -211,24 +224,25 @@ object ContinuationTranslation {
       con(array)(fun(expT(n`.`(m`.`dt), read))(x =>
         C(Join(n, m, read, dt, x))))
 
+    case Let(_, _, _, value@MakeArray(_), f) =>
+      con(f(value))(C)
+
     case Let(dt1, dt2, access, value, f) =>
       con(value)(fun(value.t)(x =>
         con(f(x))(C)))
 
     case ma@MakeArray(_) =>
-      def rec(func: Seq[Phrase[ExpType]], imp: Seq[Phrase[ExpType]]): Phrase[CommType] = {
-        func match {
-          case xf +: func => con(xf)(fun(expT(ma.dt, read))(xi =>
-            rec(func, imp :+ xi)
-          ))
-      case _ => C(MakeArray(ma.n)(ma.dt, imp))
-        }
-      }
+      // A MakeArray can be indexed directly by the C/OpenCL expression
+      // generator, but it is not a first-class C expression when a continuation
+      // consumes the aggregate as a whole.  Materialize it explicitly into a
+      // private temporary so downstream continuation code receives a normal
+      // read-view array.  This is the continuation-side counterpart of
+      // AcceptorTranslation's element-wise MakeArray destination write.
+      shine.OpenCL.DSL.`new`(rise.core.types.AddressSpace.Private)(ma.t.dataType, tmp =>
+        acc(ma)(tmp.wr) `;` C(tmp.rd))
 
-      rec(ma.elements, Seq())
-
-    case Materialize(dt, input) =>
-      `new`(dt, tmp => acc(Materialize(dt, input))(tmp.wr) `;` C(tmp.rd))
+    case Materialize(_, input) =>
+      con(input)(C)
 
     case StaticIterate(_, dt, _, _) =>
       shine.OpenCL.DSL.`new`(rise.core.types.AddressSpace.Private)(dt, tmp =>

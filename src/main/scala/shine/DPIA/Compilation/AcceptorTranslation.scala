@@ -135,6 +135,32 @@ object AcceptorTranslation {
   def primitive(E: ExpPrimitive)
                (A: Phrase[AccType])
                (implicit context: TranslationContext): Phrase[CommType] = {
+    def reduceSourceWrapper(input: Phrase[ExpType]): Phrase[ExpType] =
+      input match {
+        case Apply(fun, arg) =>
+          reduceSourceWrapper(Lifting.liftFunction(fun).reducing(arg))
+        case DepApply(_, fun, arg) => arg match {
+          case a: Nat =>
+            reduceSourceWrapper(Lifting.liftDependentFunction(
+              fun.asInstanceOf[Phrase[`(nat)->:`[ExpType]]])(a))
+          case a: DataType =>
+            reduceSourceWrapper(Lifting.liftDependentFunction(
+              fun.asInstanceOf[Phrase[`(dt)->:`[ExpType]]])(a))
+        }
+        case _ => input
+      }
+
+    def structuredProjectWriteSource(input: Phrase[ExpType]): Boolean =
+      reduceSourceWrapper(input) match {
+        case Materialize(_, _) | Generate(_, _, _) | MakeArray(_) |
+             Join(_, _, _, _, _) | StaticIterate(_, _, _, _) |
+             Map(_, _, _, _, _, _) | MapSeq(_) |
+             ReduceSeq(_) | ocl.ReduceSeq(_) =>
+          true
+        case _ =>
+          false
+      }
+
     def copyReadInto(
       dt: DataType,
       input: Phrase[ExpType],
@@ -207,8 +233,72 @@ object AcceptorTranslation {
               copyReadInto(dt, accumulator.rd, output))
 
       input match {
+        case Apply(_, _) | DepApply(_, _, _) =>
+          copyReadInto(dt, reduceSourceWrapper(input), output)
+
         case Materialize(_, inner) =>
           copyReadInto(dt, inner, output)
+
+        case Idx(total, elemT, index, Join(n, m, _, _, array)) =>
+          // Keep projected writes in destination-passing form.  Without this
+          // pushdown, ProjectWrite over a joined tile can force the joined
+          // source into a private read-valued aggregate before selecting the
+          // requested element.  That loses the intended "write one destination
+          // element" structure and leaves small private vec arrays in OpenCL.
+          con(index)(fun(index.t)(i => {
+            val iNat = IndexAsNat(total, i)
+            val outer = NatAsIndex(n, iNat / Natural(m))
+            val inner = NatAsIndex(m, iNat % Natural(m))
+            copyReadInto(
+              dt,
+              Idx(m, elemT, inner, Idx(n, m`.`elemT, outer, array)),
+              output)
+          }))
+
+        case Idx(m, elemT, inner, Idx(n, _, outer, Generate(_, _, f))) =>
+          con(outer)(fun(outer.t)(o =>
+            con(inner)(fun(inner.t)(i =>
+              copyReadInto(dt, Idx(m, elemT, i, f(o)), output)))))
+
+        case Idx(_, elemT, index, Generate(_, _, f)) =>
+          con(index)(fun(index.t)(i =>
+            copyReadInto(dt, f(i), output)))
+
+        case nestedIdxMakeArray@Idx(
+            m,
+            elemT,
+            inner,
+            Idx(n, ArrayType(_, _), outer, makeArray@MakeArray(_))) =>
+          val (_, rows) = makeArray.unwrap
+          if (rows.length != n.eval) {
+            con(nestedIdxMakeArray)(fun(expT(dt, read))(x => output :=| dt | x))
+          } else {
+            con(outer)(fun(outer.t)(o =>
+              con(inner)(fun(inner.t)(i =>
+                rows.zipWithIndex.reverse.foldLeft(Skip(): Phrase[CommType]) {
+                  case (elseBranch, (row, rowIndex)) =>
+                    IfThenElse(
+                      o =:= NatAsIndex(n, Natural(Cst(rowIndex.toLong))),
+                      copyReadInto(dt, Idx(m, elemT, i, row), output),
+                      elseBranch)
+                }))))
+          }
+
+        case idxMakeArray@Idx(n, elemT, index, makeArray@MakeArray(_)) =>
+          val (_, elements) = makeArray.unwrap
+          if (elements.length != n.eval) {
+            con(idxMakeArray)(fun(expT(dt, read))(x => output :=| dt | x))
+          } else {
+            con(index)(fun(index.t)(i => {
+              elements.zipWithIndex.reverse.foldLeft(Skip(): Phrase[CommType]) {
+                case (elseBranch, (elem, elemIndex)) =>
+                  IfThenElse(
+                    i =:= NatAsIndex(n, Natural(Cst(elemIndex.toLong))),
+                    copyReadInto(elemT, elem, output),
+                    elseBranch)
+              }
+            }))
+          }
 
         case Generate(n, elemT, f) =>
           dt match {
@@ -279,6 +369,187 @@ object AcceptorTranslation {
       }
     }
 
+    def flattenedElementCount(dt: DataType): Nat =
+      dt match {
+        case ArrayType(n, elemT) => n * flattenedElementCount(elemT)
+        case _ => Cst(1)
+      }
+
+    def flattenedLeafType(dt: DataType): DataType =
+      dt match {
+        case ArrayType(_, elemT) => flattenedLeafType(elemT)
+        case leafT => leafT
+      }
+
+    def unjoinProjectWriteSource(
+      dt: DataType,
+      input: Phrase[ExpType]
+    ): (DataType, Phrase[ExpType]) =
+      reduceSourceWrapper(input) match {
+        case Materialize(_, inner) =>
+          unjoinProjectWriteSource(dt, inner)
+        case Join(n, m, _, elemT, array) =>
+          unjoinProjectWriteSource(ArrayType(n, ArrayType(m, elemT)), array)
+        case _ =>
+          (dt, input)
+      }
+
+    def projectWriteSourceStructured(
+      total: Nat,
+      dstExtent: Nat,
+      indices: Phrase[ExpType],
+      sourceT: DataType,
+      source: Phrase[ExpType],
+      flatBase: Phrase[ExpType],
+      output: Phrase[AccType]
+    ): Phrase[CommType] = {
+      def emitLeaf(src: Phrase[ExpType], srcT: DataType): Phrase[CommType] = {
+        val flatIndex = NatAsIndex(total, flatBase)
+        con(indices `@` flatIndex)(fun(expT(idx(dstExtent), read))(dst =>
+          copyReadInto(srcT, src, output `@` dst)))
+      }
+
+      val reducedSource = reduceSourceWrapper(source)
+      reducedSource match {
+        case LetNat(binder, defn, body) =>
+          LetNat(
+            binder,
+            defn,
+            projectWriteSourceStructured(
+              total, dstExtent, indices, sourceT, body, flatBase, output))
+
+        case Let(dt1, _, _, value, f) =>
+          con(value)(fun(expT(dt1, read))(x =>
+            projectWriteSourceStructured(
+              total, dstExtent, indices, sourceT, f(x), flatBase, output)))
+
+        case Materialize(_, inner) =>
+          projectWriteSourceStructured(
+            total, dstExtent, indices, sourceT, inner, flatBase, output)
+
+        case _ =>
+          sourceT match {
+            case ArrayType(n, elemT) =>
+              val stride = flattenedElementCount(elemT)
+              reducedSource match {
+                case Generate(_, _, f) =>
+                  `for`(n, i =>
+                    projectWriteSourceStructured(
+                      total,
+                      dstExtent,
+                      indices,
+                      elemT,
+                      f(i),
+                      flatBase + (IndexAsNat(n, i) * Natural(stride)),
+                      output))
+
+                case makeArray@MakeArray(_) =>
+                  val (_, elements) = makeArray.unwrap
+                  elements.zipWithIndex.foldLeft(
+                    comment("projectWrite structured MakeArray"): Phrase[CommType]) {
+                    case (body, (elem, idx)) =>
+                      body `;` projectWriteSourceStructured(
+                        total,
+                        dstExtent,
+                        indices,
+                        elemT,
+                        elem,
+                        flatBase + Natural(stride * Cst(idx.toLong)),
+                        output)
+                  }
+
+                case mapSeq@MapSeq(unroll) =>
+                  val (mapN, dt1, dt2, f, array) = mapSeq.unwrap
+                  val mapStride = flattenedElementCount(dt2)
+                  reduceSourceWrapper(array) match {
+                    case Generate(_, _, g) =>
+                      comment("projectWrite structured mapSeq generate") `;`
+                        `for`(unroll, mapN, i =>
+                          projectWriteSourceStructured(
+                            total,
+                            dstExtent,
+                            indices,
+                            dt2,
+                            f(g(i)),
+                            flatBase + (IndexAsNat(mapN, i) * Natural(mapStride)),
+                            output))
+
+                    case makeArray@MakeArray(_) =>
+                      val (_, elements) = makeArray.unwrap
+                      elements.zipWithIndex.foldLeft(
+                        comment("projectWrite structured mapSeq makeArray"): Phrase[CommType]) {
+                        case (body, (elem, idx)) =>
+                          body `;` projectWriteSourceStructured(
+                            total,
+                            dstExtent,
+                            indices,
+                            dt2,
+                            f(elem),
+                            flatBase + Natural(mapStride * Cst(idx.toLong)),
+                            output)
+                      }
+
+                    case _ =>
+                      con(array)(fun(expT(mapN`.`dt1, read))(x =>
+                        comment("projectWrite structured mapSeq") `;`
+                          `for`(unroll, mapN, i =>
+                            projectWriteSourceStructured(
+                              total,
+                              dstExtent,
+                              indices,
+                              dt2,
+                              f(x `@` i),
+                              flatBase + (IndexAsNat(mapN, i) * Natural(mapStride)),
+                              output))))
+                  }
+
+                case map@ocl.Map(level, dim) =>
+                  val (mapN, dt1, dt2, f, array) = map.unwrap
+                  val sourceFlatCount = flattenedElementCount(sourceT)
+                  val sourceLeafT = flattenedLeafType(sourceT)
+                  val mapStride = flattenedElementCount(dt2)
+                  con(array)(fun(expT(mapN`.`dt1, read))(x =>
+                    shine.OpenCL.DSL.parFor(level, dim, unroll = false)(
+                      mapN,
+                      dt2,
+                      ProjectWriteAcc(
+                        sourceFlatCount,
+                        dstExtent,
+                        total,
+                        sourceT,
+                        sourceLeafT,
+                        flatBase,
+                        indices,
+                        output),
+                      fun(expT(idx(mapN), read))(i =>
+                        fun(accT(dt2))(_ =>
+                          projectWriteSourceStructured(
+                            total,
+                            dstExtent,
+                            indices,
+                            dt2,
+                            f(x `@` i),
+                            flatBase + (IndexAsNat(mapN, i) * Natural(mapStride)),
+                            output))))))
+
+                case _ =>
+                  `for`(n, i =>
+                    projectWriteSourceStructured(
+                      total,
+                      dstExtent,
+                      indices,
+                      elemT,
+                      source `@` i,
+                      flatBase + (IndexAsNat(n, i) * Natural(stride)),
+                      output))
+              }
+
+            case _ =>
+              emitLeaf(source, sourceT)
+          }
+      }
+    }
+
     E match {
     case makeArray@MakeArray(n) =>
       val (elemT, elements) = makeArray.unwrap
@@ -290,6 +561,11 @@ object AcceptorTranslation {
 
     case Generate(n, _, f) =>
       `for`(n, i => acc(f(i))(A `@` i))
+
+    case Idx(n, dt, index, array) =>
+      con(array)(fun(expT(n`.`dt, read))(x =>
+        con(index)(fun(index.t)(i =>
+          copyReadInto(dt, x `@` i, A)))))
 
     case AsScalar(n, m, dt, access, array) =>
       acc(array)(AsScalarAcc(n, m, dt, A))
@@ -488,9 +764,17 @@ object AcceptorTranslation {
       con(indices)(fun(expT(n`.`idx(m), read))(y =>
         acc(input)(ScatterAcc(n, m, dt, y, A))))
 
-    case ProjectWrite(n, m, dt, _, indices, input) =>
-      con(indices)(fun(expT(n`.`idx(m), read))(y =>
-        acc(input)(ScatterAcc(n, m, dt, y, A))))
+    case ProjectWrite(n, m, dt, sourceAccess, indices, input) =>
+      if (sourceAccess == read || structuredProjectWriteSource(input)) {
+        val (sourceT, source) =
+          unjoinProjectWriteSource(input.t.dataType, input)
+        comment("projectWrite structured source") `;`
+          projectWriteSourceStructured(
+            n, m, indices, sourceT, source, Natural(Cst(0)), A)
+      } else {
+        con(indices)(fun(expT(n`.`idx(m), read))(y =>
+          acc(input)(ScatterAcc(n, m, dt, y, A))))
+      }
 
     case slide@Slide(n, sz, sp, dt, input) =>
       con(slide)(fun(expT(n`.`(sz`.`dt), read))(x =>

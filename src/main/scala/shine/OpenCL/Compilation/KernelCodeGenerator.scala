@@ -222,7 +222,11 @@ class KernelCodeGenerator(override val decls: CCodeGenerator.Declarations,
       case (CIntExpr(Cst(i)) :: _, _: VectorType) =>
         cont(OpenCL.AST.VectorSubscript(expr, C.AST.ArithmeticExpr(Cst(i))))
       case (CIntExpr(i) :: _, _: VectorType) =>
-        error(s"expected constant access to vector elements, found $i")
+        // OpenCL C supports array-style indexing for vector values (`v[i]`).
+        // Keep constant lanes as `.s0`/`.sa` swizzles for readable output, but
+        // lower dynamic vector-lane access through the generic subscript form
+        // instead of rejecting otherwise valid kernels.
+        cont(C.AST.ArraySubscript(expr, C.AST.ArithmeticExpr(i)))
       case _ => super.generateAccess(dt, expr, path, env, cont)
     }
   }

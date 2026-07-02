@@ -1015,7 +1015,7 @@ object fromRise {
       case core.materialize() => fromType {
         case expT(t, `read`) ->: expT(_, `write`)
         =>
-        fun[ExpType](expT(t, read), e => Materialize(t, e))
+          fun[ExpType](expT(t, read), e => Materialize(t, e))
       }
 
       case rocl.oclToMem() => fromType {

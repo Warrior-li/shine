@@ -133,12 +133,22 @@ class Printer extends shine.C.AST.CPrinter {
     printExpr(vs.vector, parenthesize = true)
     vs.index match {
       case ArithmeticExpr(arithexpr.arithmetic.Cst(c)) =>
-        print(s".s$c")
+        print(s".s${vectorLaneName(c)}")
       case Literal(str) =>
-        print(s".s$str")
+        print(s".s${vectorLaneName(str)}")
       case _ => throw new Exception(s"did not expect ${vs.index}")
     }
   }
+
+  private def vectorLaneName(c: Long): String =
+    vectorLaneName(c.toString)
+
+  private def vectorLaneName(raw: String): String =
+    raw.toIntOption match {
+      case Some(i) if 0 <= i && i < 16 =>
+        Integer.toString(i, 16)
+      case _ => raw
+    }
 
   def printVectorLiteral(vl: VectorLiteral): Unit = {
     val VectorType(m, dt, _) = vl.t

@@ -287,6 +287,56 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
       case _ => error(s"Expected a C-Integer-Expression on the path.")
     }
 
+    case ProjectWriteAcc(n, m, total, sourceT, leafT, flatBase, y, a) =>
+      def flattenAccArrayPath(
+        dt: DataType,
+        p: Path
+      ): (DataType, Nat, Path) =
+        dt match {
+          case ArrayType(_, elemT) => p match {
+            case (i: CIntExpr) :: ps =>
+              val (nestedLeafT, nestedFlatIndex, restPath) =
+                flattenAccArrayPath(elemT, ps)
+              (
+                nestedLeafT,
+                (i.num * types.DataTypeOps.getTotalNumberOfElements(elemT)) +
+                  nestedFlatIndex,
+                restPath)
+            case _ =>
+              error(s"Expected a C-Integer-Expression on the ProjectWriteAcc path.")
+          }
+          case _ =>
+            (dt, Cst(0), p)
+        }
+
+      val (actualLeafT, flatIndex, restPath) =
+        flattenAccArrayPath(sourceT, path)
+      if (actualLeafT != leafT) {
+        error(s"ProjectWriteAcc leaf type mismatch: $actualLeafT != $leafT")
+      }
+      val projectedFlatIndex = flatBase + Natural(flatIndex)
+      Idx(
+        total,
+        IndexType(m),
+        functional.NatAsIndex(total, projectedFlatIndex),
+        y) |>
+        exp(env, Nil, {
+          case C.AST.Literal(text) =>
+            a |> acc(env, CIntExpr(Cst(text.toInt)) :: restPath, cont)
+          case C.AST.DeclRef(name) =>
+            a |> acc(env, CIntExpr(NamedVar(name, ranges(name))) :: restPath, cont)
+          case C.AST.ArithmeticExpr(ae) =>
+            a |> acc(env, CIntExpr(ae) :: restPath, cont)
+          case yic =>
+            val id = NatIdentifier(freshName("i"))
+            C.AST.Block(immutable.Seq(
+              C.AST.DeclStmt(C.AST.VarDecl(
+                id.name, C.AST.Type.int, Some(yic)
+              )),
+              a |> acc(env, CIntExpr(id) :: restPath, cont)
+            ))
+        })
+
     case MapAcc(n, dt, _, f, a) => path match {
       case (i: CIntExpr) :: ps => f(IdxAcc(n, dt, functional.NatAsIndex(n, Natural(i)), a)) |> acc(env, ps, cont)
       case _ => error(s"Expected a C-Integer-Expression on the path.")
@@ -319,6 +369,20 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
   override def exp(env: Environment,
                    path: Path,
                    cont: Expr => Stmt): Phrase[ExpType] => Stmt = {
+    case Apply(fun, arg) =>
+      Lifting.liftFunction(fun).reducing(arg) |> exp(env, path, cont)
+
+    case DepApply(_, fun, arg) => arg match {
+      case a: Nat =>
+        Lifting.liftDependentFunction(
+          fun.asInstanceOf[Phrase[`(nat)->:`[ExpType]]])(a) |>
+          exp(env, path, cont)
+      case a: DataType =>
+        Lifting.liftDependentFunction(
+          fun.asInstanceOf[Phrase[`(dt)->:`[ExpType]]])(a) |>
+          exp(env, path, cont)
+    }
+
     case i@Identifier(_, ExpType(dt, _)) => generateAccess(dt,
       env.identEnv.applyOrElse(i, (_: Phrase[_]) => {
         throw new Exception(s"Expected to find `$i' in the environment: `${env.identEnv}'")
@@ -508,6 +572,12 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
       case _ => error(s"Expected path to be not empty")
     }
 
+    case Generate(n, _, f) => path match {
+      case (i: CIntExpr) :: ps =>
+        f(functional.NatAsIndex(n, Natural(i))) |> exp(env, ps, cont)
+      case _ => error(s"Expected path to be not empty")
+    }
+
     case GenerateCont(n, dt, f) => path match {
       case (i: CIntExpr) :: ps =>
         val continue_cmd =
@@ -524,28 +594,20 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
       } catch {
         case NotEvaluableException() =>
           genNat(i.num, env, idx => {
-            def select(elemIdx: Int)(k: Expr => Stmt): Stmt =
+            def select(elemIdx: Int): Stmt =
               if (elemIdx == m.elements.length - 1) {
-                m.elements(elemIdx) |> exp(env, Nil, k)
+                m.elements(elemIdx) |> exp(env, ps, cont)
               } else {
-                m.elements(elemIdx) |> exp(env, Nil, elem =>
-                  select(elemIdx + 1)(tail =>
-                    k(C.AST.TernaryExpr(
-                      C.AST.BinaryExpr(
-                        idx,
-                        C.AST.BinaryOperator.==,
-                        C.AST.Literal(elemIdx.toString)),
-                      elem,
-                      tail))))
+                C.AST.IfThenElse(
+                  C.AST.BinaryExpr(
+                    idx,
+                    C.AST.BinaryOperator.==,
+                    C.AST.Literal(elemIdx.toString)),
+                  m.elements(elemIdx) |> exp(env, ps, cont),
+                  Some(select(elemIdx + 1)))
               }
 
-            select(0)(selected =>
-              generateAccess(
-                m.dt,
-                selected,
-                ps,
-                env,
-                cont))
+            select(0)
           })
       }
       case _ => error(s"did not expect $path")
@@ -563,8 +625,7 @@ class CodeGenerator(val decls: CodeGenerator.Declarations,
     case Proj1(pair) => SimplifyNats.simplifyIndexAndNatExp(Lifting.liftPair(pair)._1) |> exp(env, path, cont)
     case Proj2(pair) => SimplifyNats.simplifyIndexAndNatExp(Lifting.liftPair(pair)._2) |> exp(env, path, cont)
 
-    case phrase@(Apply(_, _) | DepApply(_, _, _) |
-                 Phrases.IfThenElse(_, _, _) | LetNat(_, _, _) | _: ExpPrimitive) =>
+    case phrase@(Phrases.IfThenElse(_, _, _) | LetNat(_, _, _) | _: ExpPrimitive) =>
       error(s"Don't know how to generate code for $phrase")
   }
 

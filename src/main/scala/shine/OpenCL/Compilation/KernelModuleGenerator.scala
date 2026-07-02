@@ -111,7 +111,9 @@ object KernelModuleGenerator extends ModuleGenerator[KernelDef] {
         PackFlattenedLocalArrays.pack(internalizedBody)
       val shrunkLocalArrays =
         CleanGeneratedKernelBody.shrinkStaticLocalArrays(packedLocalArrays, funDef.wgConfig)
-      (outParam, temps, internalizedParams, declarations, shrunkLocalArrays)
+      val finalCleanedBody =
+        CleanGeneratedKernelBody.clean(shrunkLocalArrays, funDef.wgConfig, internalizedParams)
+      (outParam, temps, internalizedParams, declarations, finalCleanedBody)
   }
 
   def makeKernelModule(funDef: KernelDef): GeneratedCode => KernelModule = {

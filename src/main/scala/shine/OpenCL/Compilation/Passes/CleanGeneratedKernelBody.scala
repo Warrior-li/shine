@@ -19,6 +19,7 @@ object CleanGeneratedKernelBody {
   private val MaxIntegerCseTempsPerStatement = 4
   private val MaxSmallLoopUnrollIterations = 8
   private val MaxMergedAccumulatorAssignments = 4
+  private val MaxInlineTernaryAssignmentExprSize = 256
 
   private def withInit(decl: VarDecl, init: Option[Expr]): VarDecl =
     decl match {
@@ -60,7 +61,9 @@ object CleanGeneratedKernelBody {
     val pruned = pruneUnusedScalarDecls(exprForwarded)
     val finalUnrolled = simplifyStatements(simplifyExpressions(
       unrollSmallConstantLoops(unrollSmallConstantLoops(pruned))))
-    val finalValueReused = reuseIdenticalPureValueAssignments(finalUnrolled)
+    val finalHoisted = simplifyStatements(simplifyExpressions(
+      hoistLoopInvariantPrefixes(finalUnrolled)))
+    val finalValueReused = reuseIdenticalPureValueAssignments(finalHoisted)
     val lexicalIntReused = reuseKnownIntegerSubexpressions(finalValueReused)
     val ownerCollapsed = collapseSingletonLocalOwnerLoops(lexicalIntReused)
     val ownerSimplified = simplifyStatements(simplifyExpressions(
@@ -85,8 +88,306 @@ object CleanGeneratedKernelBody {
     val finalScalarInlined = inlineSingleUseScalarDecls(shrunkStaticArrays)
     val finalIntegerFactored = factorRepeatedIntegerExprs(finalScalarInlined)
     val finalIntegerReused = reuseKnownIntegerSubexpressions(finalIntegerFactored)
-    flattenTrivialBlocks(pruneUnusedScalarDecls(
-      inlineSingleUseScalarDecls(inlineLiteralIntDecls(finalIntegerReused))))
+    val arraySelectEliminated = eliminateSingleUsePrivateArraySelects(finalIntegerReused)
+    val finalInlined = pruneUnusedScalarDecls(
+      inlineSingleUseScalarDecls(inlineLiteralIntDecls(arraySelectEliminated)))
+    val splitTernaries = splitLargeTernaryAssignments(finalInlined)
+    flattenTrivialBlocks(simplifyKnownBranchConditions(splitTernaries))
+  }
+
+  private case class BranchFact(value: Boolean, refs: Set[String])
+
+  private def simplifyKnownBranchConditions(stmt: Stmt): Stmt =
+    simplifyKnownBranchConditions(stmt, Map.empty)
+
+  private def simplifyKnownBranchConditions(
+      stmt: Stmt,
+      facts: Map[String, BranchFact]
+    ): Stmt =
+    stmt match {
+      case Block(body) =>
+        val out = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+        var currentFacts = facts
+        body.foreach { s =>
+          val rewritten = simplifyKnownBranchConditions(s, currentFacts)
+          out ++= flatten(rewritten)
+          val writes = assignedNames(s)
+          if (writes.nonEmpty) {
+            currentFacts = currentFacts.filterNot {
+              case (_, fact) => fact.refs.exists(writes.contains)
+            }
+          }
+        }
+        Block(out.toSeq)
+
+      case Stmts(a, b) =>
+        simplifyKnownBranchConditions(Block(flatten(Stmts(a, b))), facts)
+
+      case ForLoop(init, cond, increment, body) =>
+        val bodyFacts = facts -- assignedNames(init)
+        val rewrittenBody = simplifyKnownBranchConditions(body, bodyFacts)
+        ForLoop(
+          init.asInstanceOf[DeclStmt],
+          cond,
+          increment,
+          Block(flatten(rewrittenBody)))
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, simplifyKnownBranchConditions(body, facts))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        conditionFactKey(cond).flatMap(facts.get) match {
+          case Some(BranchFact(true, _)) =>
+            simplifyKnownBranchConditions(trueBody, facts)
+          case Some(BranchFact(false, _)) =>
+            falseBody
+              .map(simplifyKnownBranchConditions(_, facts))
+              .getOrElse(Block(Seq.empty))
+          case None =>
+            val key = conditionFactKey(cond)
+            val refs = collectDeclRefs(cond)
+            val trueFacts =
+              key.map(k => facts + (k -> BranchFact(value = true, refs)))
+                .getOrElse(facts)
+            val falseFacts =
+              key.map(k => facts + (k -> BranchFact(value = false, refs)))
+                .getOrElse(facts)
+            IfThenElse(
+              cond,
+              simplifyKnownBranchConditions(trueBody, trueFacts),
+              falseBody.map(simplifyKnownBranchConditions(_, falseFacts))
+            )
+        }
+
+      case other =>
+        other
+    }
+
+  private def conditionFactKey(expr: Expr): Option[String] =
+    if (pure(expr)) cPrinterKey(expr) else None
+
+  private def splitLargeTernaryAssignments(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        Block(body.map(splitLargeTernaryAssignments))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          splitLargeTernaryAssignments(a),
+          splitLargeTernaryAssignments(b)
+        )))
+
+      case ForLoop(init, cond, increment, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, increment,
+          splitLargeTernaryAssignments(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, splitLargeTernaryAssignments(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          splitLargeTernaryAssignments(trueBody),
+          falseBody.map(splitLargeTernaryAssignments)
+        )
+
+      case ExprStmt(Assignment(lhs, rhs))
+          if pure(lhs) &&
+             ternaryCount(rhs) > 0 &&
+             exprSize(rhs) > MaxInlineTernaryAssignmentExprSize =>
+        splitTernaryAssignment(lhs, rhs)
+
+      case other =>
+        other
+    }
+
+  private def splitTernaryAssignment(lhs: Expr, rhs: Expr): Stmt =
+    rhs match {
+      case TernaryExpr(cond, thenE, elseE) =>
+        IfThenElse(
+          cond,
+          blockOrStmt(Seq(splitTernaryAssignment(lhs, thenE))),
+          Some(blockOrStmt(Seq(splitTernaryAssignment(lhs, elseE))))
+        )
+      case _ =>
+        ExprStmt(Assignment(lhs, rhs))
+    }
+
+  private def ternaryCount(expr: Expr): Int =
+    expr match {
+      case TernaryExpr(cond, thenE, elseE) =>
+        1 + ternaryCount(cond) + ternaryCount(thenE) + ternaryCount(elseE)
+      case BinaryExpr(lhs, _, rhs) =>
+        ternaryCount(lhs) + ternaryCount(rhs)
+      case UnaryExpr(_, e) =>
+        ternaryCount(e)
+      case ArraySubscript(array, index) =>
+        ternaryCount(array) + ternaryCount(index)
+      case StructMemberAccess(struct, _) =>
+        ternaryCount(struct)
+      case FunCall(fun, args) =>
+        ternaryCount(fun) + args.map(ternaryCount).sum
+      case Cast(_, e) =>
+        ternaryCount(e)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.map(ternaryCount).sum
+      case _ =>
+        0
+    }
+
+  private def eliminateSingleUsePrivateArraySelects(stmt: Stmt): Stmt = {
+    def flattenedArraySize(t: C.AST.Type): Option[BigInt] =
+      t match {
+        case arr: C.AST.ArrayType =>
+          for {
+            outer <- arr.size.flatMap(constArith)
+            inner <- flattenedArraySize(arr.elemType)
+          } yield outer * inner
+        case _ =>
+          Some(BigInt(1))
+      }
+
+    def privateArrayDecl(s: Stmt): Option[(String, BigInt)] =
+      s match {
+        case DeclStmt(VarDecl(name, arr: C.AST.ArrayType, None)) =>
+          flattenedArraySize(arr).map(name -> _)
+        case DeclStmt(OpenCL.AST.VarDecl(name, arr: C.AST.ArrayType, addressSpace, None))
+            if addressSpace == AddressSpace.Private =>
+          flattenedArraySize(arr).map(name -> _)
+        case _ =>
+          None
+      }
+
+    def arrayWrite(name: String, s: Stmt): Option[(Int, Expr)] =
+      s match {
+        case ExprStmt(Assignment(ArraySubscript(DeclRef(arrayName), idx), rhs))
+            if arrayName == name =>
+          constInt(idx).map(_ -> rhs)
+        case _ =>
+          None
+      }
+
+    def arrayRead(name: String, expr: Expr): Option[Expr] =
+      expr match {
+        case ArraySubscript(DeclRef(arrayName), idx) if arrayName == name =>
+          Some(idx)
+        case _ =>
+          None
+      }
+
+    def selectAssignment(lhs: Expr, idx: Expr, values: Seq[Expr]): Stmt = {
+      def assign(value: Expr): Stmt =
+        ExprStmt(Assignment(lhs, value))
+
+      def rec(i: Int): Stmt =
+        if (i == values.length - 1) {
+          assign(values(i))
+        } else {
+          IfThenElse(
+            BinaryExpr(idx, BinaryOperator.==, Literal(i.toString)),
+            assign(values(i)),
+            Some(rec(i + 1)))
+        }
+
+      rec(0)
+    }
+
+    def rewriteBlock(body: Seq[Stmt]): Seq[Stmt] = {
+      val out = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+      var i = 0
+      while (i < body.length) {
+        privateArrayDecl(body(i)) match {
+          case Some((name, size)) if size > 0 && size <= 16 =>
+            val n = size.toInt
+            val writes = Array.fill[Option[Expr]](n)(None)
+            val kept = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+            var j = i + 1
+            var consumer: Option[(Expr, Expr)] = None
+            var valid = true
+
+            while (j < body.length && consumer.isEmpty && valid) {
+              body(j) match {
+                case ExprStmt(Assignment(lhs, rhs)) =>
+                  arrayRead(name, rhs) match {
+                    case Some(idx) =>
+                      consumer = Some(lhs -> idx)
+                    case None =>
+                      arrayWrite(name, body(j)) match {
+                        case Some((idx, rhs))
+                            if idx >= 0 && idx < n && writes(idx).isEmpty &&
+                               !readsAny(body(j), Set(name)) =>
+                          writes(idx) = Some(rhs)
+                        case Some(_) =>
+                          valid = false
+                        case None =>
+                          if (readsAny(body(j), Set(name)) || writesName(body(j), name)) {
+                            valid = false
+                          } else {
+                            kept += body(j)
+                          }
+                      }
+                  }
+
+                case other =>
+                  if (readsAny(other, Set(name)) || writesName(other, name)) {
+                    valid = false
+                  } else {
+                    kept += other
+                  }
+              }
+              j += 1
+            }
+
+            val rest = body.drop(j)
+            if (
+              valid &&
+              consumer.isDefined &&
+              writes.forall(_.isDefined) &&
+              !readsAny(Block(rest), Set(name)) &&
+              !writesName(rest, name)
+            ) {
+              val (lhs, idx) = consumer.get
+              out ++= kept
+              out += selectAssignment(lhs, idx, writes.flatten.toSeq)
+              i = j
+            } else {
+              out += body(i)
+              i += 1
+            }
+          case _ =>
+            out += body(i)
+            i += 1
+        }
+      }
+      out.toSeq
+    }
+
+    def rec(s: Stmt): Stmt =
+      s match {
+        case Block(body) =>
+          // Code generation often keeps small imperative fragments inside
+          // nested Stmts nodes.  The printer later flattens them, but this pass
+          // needs the linear statement sequence to see
+          //   decl; a[0]=...; ...; out=a[i]
+          // as one single-use private-array select pattern.
+          Block(rewriteBlock(body.flatMap(stmt => flatten(rec(stmt)))))
+        case Stmts(a, b) =>
+          blockOrStmt(rewriteBlock(flatten(Stmts(rec(a), rec(b)))))
+        case ForLoop(init, cond, increment, body) =>
+          ForLoop(
+            rec(init).asInstanceOf[DeclStmt],
+            cond,
+            increment,
+            rec(body).asInstanceOf[Block])
+        case WhileLoop(cond, body) =>
+          WhileLoop(cond, rec(body))
+        case IfThenElse(cond, trueBody, falseBody) =>
+          IfThenElse(cond, rec(trueBody), falseBody.map(rec))
+        case other =>
+          other
+      }
+
+    rec(stmt)
   }
 
   def shrinkStaticLocalArrays(
@@ -1898,12 +2199,20 @@ object CleanGeneratedKernelBody {
         Stmts(hoistLoopInvariantPrefixes(a), hoistLoopInvariantPrefixes(b))
 
       case ForLoop(init, cond, increment, body) =>
-        val loopName = init.asInstanceOf[DeclStmt].decl.name
+        val initDecl = init.asInstanceOf[DeclStmt]
+        val loopName = initDecl.decl.name
         val loopBody = hoistLoopInvariantPrefixes(body).asInstanceOf[Block]
         val stmts = loopBody.body
-        val rawPrefixLen = stmts.indexWhere(s =>
-          referencesName(s, loopName) || !hoistableLoopInvariantStmt(s, loopName))
-        val prefixLen = if (rawPrefixLen < 0) stmts.length else rawPrefixLen
+        val loopIsStaticallyPositive = loopRange(initDecl, cond) match {
+          case Some((name, IntRange(lo, hiExclusive))) =>
+            name == loopName && hiExclusive > lo && unitIncrement(loopName, increment)
+          case _ =>
+            false
+        }
+        val prefixLen = hoistableLoopInvariantPrefixLength(
+          stmts,
+          loopName,
+          loopIsStaticallyPositive)
         val suffixAssigned = stmts.drop(prefixLen).flatMap(assignedNames).toSet
         var safePrefixLen = prefixLen
         while (safePrefixLen > 0 &&
@@ -1912,11 +2221,11 @@ object CleanGeneratedKernelBody {
         }
 
         if (safePrefixLen == 0) {
-          ForLoop(init.asInstanceOf[DeclStmt], cond, increment, loopBody)
+          ForLoop(initDecl, cond, increment, loopBody)
         } else {
           Block(stmts.take(safePrefixLen) :+
             ForLoop(
-              init.asInstanceOf[DeclStmt],
+              initDecl,
               cond,
               increment,
               Block(stmts.drop(safePrefixLen))))
@@ -1932,6 +2241,49 @@ object CleanGeneratedKernelBody {
       case other =>
         other
     }
+
+  private def hoistableLoopInvariantPrefixLength(
+      stmts: Seq[Stmt],
+      loopName: String,
+      loopIsStaticallyPositive: Boolean
+    ): Int = {
+    var idx = 0
+    var continue = true
+
+    while (idx < stmts.length && continue) {
+      val stmt = stmts(idx)
+      if (referencesName(stmt, loopName) || containsBarrier(stmt)) {
+        continue = false
+      } else {
+        stmt match {
+          case DeclStmt(VarDecl(_, t, None)) if hoistablePrivateType(t) =>
+            idx += 1
+
+          case Block(body) if body.forall(hoistableLoopInvariantStmt(_, loopName)) =>
+            idx += 1
+
+          case Stmts(a, b)
+              if hoistableLoopInvariantStmt(a, loopName) &&
+                 hoistableLoopInvariantStmt(b, loopName) =>
+            idx += 1
+
+          case _ =>
+            continue = false
+        }
+      }
+    }
+
+    idx
+  }
+
+  private def hoistableInvariantAssignment(
+      name: String,
+      rhs: Expr,
+      initializedInPrefix: Set[String]
+    ): Boolean = {
+    val refs = collectDeclRefs(rhs)
+    !refs.contains(name) || initializedInPrefix.contains(name)
+  }
 
   private def flattenUnrolled(stmt: Stmt): Seq[Stmt] =
     stmt match {
@@ -2651,8 +3003,8 @@ object CleanGeneratedKernelBody {
 
   private def hoistableLoopInvariantStmt(stmt: Stmt, loopName: String): Boolean =
     !referencesName(stmt, loopName) && !containsBarrier(stmt) && (stmt match {
-      case DeclStmt(VarDecl(_, t, init)) =>
-        hoistablePrivateType(t) && init.forall(pure)
+      case DeclStmt(VarDecl(_, t, None)) =>
+        hoistablePrivateType(t)
       case ExprStmt(Assignment(DeclRef(_), _)) =>
         false
       case Block(body) =>
@@ -2675,6 +3027,16 @@ object CleanGeneratedKernelBody {
     Nodes.VisitAndRebuild(stmt, new Nodes.VisitAndRebuild.Visitor {
       override def pre(n: Node): Result =
         n match {
+          // A declaration with an initializer writes the variable at this
+          // lexical point.  Treating it as a pure declaration is unsafe for
+          // loop-prefix hoisting: reduce accumulators such as `float16 acc =
+          // 0` must be reinitialized for every enclosing map/loop iteration.
+          case DeclStmt(OpenCL.AST.VarDecl(name, _, _, Some(_))) =>
+            names += name
+            Continue(n, this)
+          case DeclStmt(VarDecl(name, _, Some(_))) =>
+            names += name
+            Continue(n, this)
           case Assignment(lhs, _) =>
             lvalueRoot(lhs).foreach(names += _)
             Continue(n, this)
@@ -3784,6 +4146,12 @@ object CleanGeneratedKernelBody {
     Nodes.VisitAndRebuild(stmt, new Nodes.VisitAndRebuild.Visitor {
       override def pre(n: Node): Result =
         n match {
+          case DeclStmt(OpenCL.AST.VarDecl(`name`, _, _, Some(_))) =>
+            found = true
+            Stop(n)
+          case DeclStmt(VarDecl(`name`, _, Some(_))) =>
+            found = true
+            Stop(n)
           case Assignment(lhs, _) if lvalueRoot(lhs).contains(name) =>
             found = true
             Stop(n)
@@ -3799,6 +4167,12 @@ object CleanGeneratedKernelBody {
     Nodes.VisitAndRebuild(stmt, new Nodes.VisitAndRebuild.Visitor {
       override def pre(n: Node): Result =
         n match {
+          case DeclStmt(OpenCL.AST.VarDecl(name, _, _, Some(_))) =>
+            names += name
+            Continue(n, this)
+          case DeclStmt(VarDecl(name, _, Some(_))) =>
+            names += name
+            Continue(n, this)
           case Assignment(lhs, _) =>
             lvalueRoot(lhs).foreach(names += _)
             Continue(n, this)
