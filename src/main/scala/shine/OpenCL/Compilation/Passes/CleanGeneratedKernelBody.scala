@@ -16,8 +16,8 @@ import shine.OpenCL.{BuiltInFunctionCall, GlobalSize, LocalSize}
  * whose initializers are pure expressions.
  */
 object CleanGeneratedKernelBody {
-  private val MaxIntegerCseTempsPerStatement = 0
-  private val MaxIntegerCseTempsPerBlock = 0
+  private val MaxIntegerCseTempsPerStatement = 4
+  private val MaxIntegerCseTempsPerBlock = 6
   private val MaxSmallLoopUnrollIterations = 8
   private val MaxMergedAccumulatorAssignments = 4
   private val MaxInlineTernaryAssignmentExprSize = 256
@@ -4571,7 +4571,9 @@ object CleanGeneratedKernelBody {
 
   private def generatedTempsAreLexicallyScoped(stmt: Stmt): Boolean = {
     def isGeneratedTemp(name: String): Boolean =
-      name.startsWith("_np_cse") || name.startsWith("_np_lhs_idx")
+      name.startsWith("_np_cse") ||
+        name.startsWith("_np_block_cse") ||
+        name.startsWith("_np_lhs_idx")
 
     def allPrintedGeneratedRefsAreDeclared: Boolean = {
       try {
@@ -4637,10 +4639,10 @@ object CleanGeneratedKernelBody {
   }
 
   private val GeneratedTempPattern =
-    raw"\b(_np_(?:cse|lhs_idx)[0-9]+)\b".r
+    raw"\b(_np_(?:cse|block_cse|lhs_idx)[0-9]+)\b".r
 
   private val GeneratedTempDeclPattern =
-    raw"\b(?:int|uint|long|ulong|size_t)\s+(_np_(?:cse|lhs_idx)[0-9]+)\b".r
+    raw"\b(?:int|uint|long|ulong|size_t)\s+(_np_(?:cse|block_cse|lhs_idx)[0-9]+)\b".r
 
   private def generatedTempRefsInText(text: String): Set[String] =
     GeneratedTempPattern.findAllMatchIn(text).map(_.group(1)).toSet
