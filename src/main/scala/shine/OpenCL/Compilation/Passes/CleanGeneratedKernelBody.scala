@@ -16,8 +16,8 @@ import shine.OpenCL.{BuiltInFunctionCall, GlobalSize, LocalSize}
  * whose initializers are pure expressions.
  */
 object CleanGeneratedKernelBody {
-  private val MaxIntegerCseTempsPerStatement = 4
-  private val MaxIntegerCseTempsPerBlock = 6
+  private val MaxIntegerCseTempsPerStatement = 0
+  private val MaxIntegerCseTempsPerBlock = 0
   private val MaxSmallLoopUnrollIterations = 8
   private val MaxMergedAccumulatorAssignments = 4
   private val MaxInlineTernaryAssignmentExprSize = 256
@@ -111,7 +111,19 @@ object CleanGeneratedKernelBody {
       }
     val finalTernariesSplit = splitLargeTernaryAssignments(branchDecodeReduced)
     val lhsIndexHoisted = hoistLongArrayAssignmentLhsIndices(finalTernariesSplit)
-    flattenTrivialBlocks(simplifyKnownBranchConditions(lhsIndexHoisted))
+    val fallbackTernariesSplit = splitLargeTernaryAssignments(branchLhsHoisted)
+    val fallbackLhsIndexHoisted =
+      hoistLongArrayAssignmentLhsIndices(fallbackTernariesSplit)
+    Seq(
+      flattenTrivialBlocks(simplifyKnownBranchConditions(lhsIndexHoisted)),
+      flattenTrivialBlocks(lhsIndexHoisted),
+      flattenTrivialBlocks(simplifyKnownBranchConditions(fallbackLhsIndexHoisted)),
+      flattenTrivialBlocks(fallbackLhsIndexHoisted),
+      flattenTrivialBlocks(simplifyKnownBranchConditions(branchLhsHoisted)),
+      flattenTrivialBlocks(branchLhsHoisted),
+      flattenTrivialBlocks(finalInlined)
+    ).find(generatedTempsAreLexicallyScoped)
+      .getOrElse(flattenTrivialBlocks(finalInlined))
   }
 
   private case class BranchFact(value: Boolean, refs: Set[String])
@@ -4525,20 +4537,116 @@ object CleanGeneratedKernelBody {
       case _ =>
     }
 
-  private def collectDeclRefs(expr: Expr): Set[String] = {
-    val refs = scala.collection.mutable.Set.empty[String]
-    Nodes.VisitAndRebuild(expr, new Nodes.VisitAndRebuild.Visitor {
-      override def pre(n: Node): Result =
-        n match {
-          case DeclRef(name) =>
-            refs += name
-            Continue(n, this)
-          case _ =>
-            Continue(n, this)
-        }
-    })
-    refs.toSet
+  private def collectDeclRefs(expr: Expr): Set[String] =
+    expr match {
+      case DeclRef(name) =>
+        Set(name)
+      case FunCall(fun, args) =>
+        collectDeclRefs(fun) ++ args.flatMap(collectDeclRefs)
+      case ArraySubscript(array, index) =>
+        collectDeclRefs(array) ++ collectDeclRefs(index)
+      case StructMemberAccess(struct, member) =>
+        collectDeclRefs(struct) ++ collectDeclRefs(member)
+      case UnaryExpr(_, e) =>
+        collectDeclRefs(e)
+      case BinaryExpr(lhs, _, rhs) =>
+        collectDeclRefs(lhs) ++ collectDeclRefs(rhs)
+      case TernaryExpr(cond, thenE, elseE) =>
+        collectDeclRefs(cond) ++ collectDeclRefs(thenE) ++ collectDeclRefs(elseE)
+      case Cast(_, e) =>
+        collectDeclRefs(e)
+      case ArrayLiteral(_, inits) =>
+        inits.flatMap(collectDeclRefs).toSet
+      case RecordLiteral(_, fst, snd) =>
+        collectDeclRefs(fst) ++ collectDeclRefs(snd)
+      case ArithmeticExpr(ae) =>
+        generatedTempRefsInText(ae.toString)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.flatMap(collectDeclRefs).toSet
+      case shine.OpenCL.AST.VectorSubscript(vector, index) =>
+        collectDeclRefs(vector) ++ collectDeclRefs(index)
+      case _ =>
+        Set.empty
+    }
+
+  private def generatedTempsAreLexicallyScoped(stmt: Stmt): Boolean = {
+    def isGeneratedTemp(name: String): Boolean =
+      name.startsWith("_np_cse") || name.startsWith("_np_lhs_idx")
+
+    def allPrintedGeneratedRefsAreDeclared: Boolean = {
+      try {
+        val printed = shine.OpenCL.AST.Printer(stmt)
+        generatedTempRefsInText(printed)
+          .forall(name => declaredNamesInText(printed).contains(name))
+      } catch {
+        case _: Exception =>
+          true
+      }
+    }
+
+    def exprOk(expr: Expr, scope: Set[String]): Boolean =
+      collectDeclRefs(expr).forall(name => !isGeneratedTemp(name) || scope.contains(name))
+
+    def stmtOk(s: Stmt, scope: Set[String]): (Boolean, Set[String]) =
+      s match {
+        case Block(body) =>
+          var currentScope = scope
+          var ok = true
+          body.foreach { child =>
+            val (childOk, childScope) = stmtOk(child, currentScope)
+            ok &&= childOk
+            currentScope = childScope
+          }
+          ok -> currentScope
+
+        case Stmts(a, b) =>
+          val (aOk, aScope) = stmtOk(a, scope)
+          val (bOk, bScope) = stmtOk(b, aScope)
+          (aOk && bOk) -> bScope
+
+        case DeclStmt(VarDecl(name, _, init)) =>
+          init.forall(exprOk(_, scope)) -> (scope + name)
+
+        case ExprStmt(Assignment(lhs, rhs)) =>
+          (exprOk(lhs, scope) && exprOk(rhs, scope)) -> scope
+
+        case ExprStmt(expr) =>
+          exprOk(expr, scope) -> scope
+
+        case ForLoop(init, cond, increment, body) =>
+          val (initOk, loopScope) = stmtOk(init, scope)
+          val bodyOk =
+            exprOk(cond, loopScope) &&
+              exprOk(increment, loopScope) &&
+              stmtOk(body, loopScope)._1
+          (initOk && bodyOk) -> scope
+
+        case WhileLoop(cond, body) =>
+          (exprOk(cond, scope) && stmtOk(body, scope)._1) -> scope
+
+        case IfThenElse(cond, trueBody, falseBody) =>
+          val trueOk = stmtOk(trueBody, scope)._1
+          val falseOk = falseBody.forall(stmtOk(_, scope)._1)
+          (exprOk(cond, scope) && trueOk && falseOk) -> scope
+
+        case _ =>
+          true -> scope
+      }
+
+    allPrintedGeneratedRefsAreDeclared && stmtOk(stmt, Set.empty)._1
   }
+
+  private val GeneratedTempPattern =
+    raw"\b(_np_(?:cse|lhs_idx)[0-9]+)\b".r
+
+  private val GeneratedTempDeclPattern =
+    raw"\b(?:int|uint|long|ulong|size_t)\s+(_np_(?:cse|lhs_idx)[0-9]+)\b".r
+
+  private def generatedTempRefsInText(text: String): Set[String] =
+    GeneratedTempPattern.findAllMatchIn(text).map(_.group(1)).toSet
+
+  private def declaredNamesInText(text: String): Set[String] =
+    GeneratedTempDeclPattern.findAllMatchIn(text).map(_.group(1)).toSet
 
   private def freshName(
       prefix: String,
