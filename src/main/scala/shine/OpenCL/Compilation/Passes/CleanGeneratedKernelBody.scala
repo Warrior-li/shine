@@ -17,6 +17,7 @@ import shine.OpenCL.{BuiltInFunctionCall, GlobalSize, LocalSize}
  */
 object CleanGeneratedKernelBody {
   private val MaxIntegerCseTempsPerStatement = 4
+  private val MaxIntegerCseTempsPerBlock = 6
   private val MaxSmallLoopUnrollIterations = 8
   private val MaxMergedAccumulatorAssignments = 4
   private val MaxInlineTernaryAssignmentExprSize = 256
@@ -93,7 +94,8 @@ object CleanGeneratedKernelBody {
       inlineSingleUseScalarDecls(inlineLiteralIntDecls(arraySelectEliminated)))
     val splitTernaries = splitLargeTernaryAssignments(finalInlined)
     val branchLhsHoisted = hoistCommonBranchAssignmentLhsIndices(splitTernaries)
-    val branchIntegerFactored = factorRepeatedIntegerExprs(branchLhsHoisted)
+    val branchBlockIntegerHoisted = hoistFrequentIntegerSubexprs(branchLhsHoisted)
+    val branchIntegerFactored = factorRepeatedIntegerExprs(branchBlockIntegerHoisted)
     val branchIntegerReused = reuseKnownIntegerSubexpressions(branchIntegerFactored)
     val branchOriginalSimplified =
       simplifyStatements(simplifyExpressions(branchLhsHoisted))
@@ -106,7 +108,8 @@ object CleanGeneratedKernelBody {
       } else {
         branchLhsHoisted
       }
-    flattenTrivialBlocks(simplifyKnownBranchConditions(branchDecodeReduced))
+    val finalTernariesSplit = splitLargeTernaryAssignments(branchDecodeReduced)
+    flattenTrivialBlocks(simplifyKnownBranchConditions(finalTernariesSplit))
   }
 
   private case class BranchFact(value: Boolean, refs: Set[String])
@@ -208,12 +211,16 @@ object CleanGeneratedKernelBody {
       case ExprStmt(Assignment(lhs, rhs))
           if pure(lhs) &&
              ternaryCount(rhs) > 0 &&
-             exprSize(rhs) > MaxInlineTernaryAssignmentExprSize =>
+             largeInlineTernaryExpr(rhs) =>
         splitTernaryAssignment(lhs, rhs)
 
       case other =>
         other
     }
+
+  private def largeInlineTernaryExpr(expr: Expr): Boolean =
+    exprSize(expr) > MaxInlineTernaryAssignmentExprSize ||
+      cPrinterKey(expr).exists(_.length > MaxInlineTernaryAssignmentExprSize)
 
   private def hoistCommonBranchAssignmentLhsIndices(stmt: Stmt): Stmt =
     stmt match {
@@ -3453,6 +3460,87 @@ object CleanGeneratedKernelBody {
         other
     }
 
+  private def hoistFrequentIntegerSubexprs(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        val recursivelyCleaned = body.map(hoistFrequentIntegerSubexprs)
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        recursivelyCleaned.foreach(collectDeclNames(_, usedNames))
+        Block(hoistFrequentIntegerSubexprsInBlock(recursivelyCleaned, usedNames))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistFrequentIntegerSubexprs(a),
+          hoistFrequentIntegerSubexprs(b)
+        )))
+
+      case ForLoop(init, cond, increment, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, increment,
+          hoistFrequentIntegerSubexprs(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistFrequentIntegerSubexprs(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(cond, hoistFrequentIntegerSubexprs(trueBody),
+          falseBody.map(hoistFrequentIntegerSubexprs))
+
+      case other =>
+        other
+    }
+
+  private def hoistFrequentIntegerSubexprsInBlock(
+      body: Seq[Stmt],
+      usedNames: scala.collection.mutable.Set[String]
+    ): Seq[Stmt] = {
+    var current = body
+    val temps = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+    var remaining = MaxIntegerCseTempsPerBlock
+    val declaredInBlock = scala.collection.mutable.Set.empty[String]
+    current.foreach(collectDeclNames(_, declaredInBlock))
+
+    while (remaining > 0) {
+      val assignedInBlock = current.flatMap(assignedNames).toSet
+      chooseFrequentIntegerSubexpr(
+        current,
+        disallowedRefs = declaredInBlock.toSet ++ assignedInBlock
+      ) match {
+        case Some(candidate) =>
+          val tmp = freshName("_np_block_cse", usedNames)
+          temps += DeclStmt(VarDecl(tmp, Type.int, Some(candidate)))
+          current = current.map(replaceExprInStmt(_, candidate, DeclRef(tmp)))
+          remaining -= 1
+        case None =>
+          remaining = 0
+      }
+    }
+
+    temps.toSeq ++ current
+  }
+
+  private def chooseFrequentIntegerSubexpr(
+      stmts: Seq[Stmt],
+      disallowedRefs: Set[String]
+    ): Option[Expr] = {
+    val counts = scala.collection.mutable.Map.empty[String, (Expr, Int)]
+    stmts.flatMap(collectIntegerSubexprs).foreach { e =>
+      val key = C.AST.Printer(e)
+      val (_, count) = counts.getOrElse(key, e -> 0)
+      counts.update(key, e -> (count + 1))
+    }
+    counts.values.collect {
+      case (e, count)
+          if count >= 6 &&
+             exprSize(e) >= 3 &&
+             (containsIntegerDivOrMod(e) || containsShiftOrMask(e)) &&
+             collectDeclRefs(e).intersect(disallowedRefs).isEmpty =>
+        (e, expensiveIntegerOpCseScore(e, count))
+    }.toSeq
+      .sortBy { case (e, score) => (-score, -exprSize(e), e.toString) }
+      .headOption
+      .map(_._1)
+  }
+
   private def inlineSingleUseScalarDecls(stmt: Stmt): Stmt =
     stmt match {
       case Block(body) =>
@@ -3768,7 +3856,11 @@ object CleanGeneratedKernelBody {
 
   private def smallIntegerExpr(t: Type, expr: Expr): Boolean =
     t match {
-      case BasicType("int", _) => exprSize(expr) <= 3 && localIntegerExpr(expr)
+      case BasicType("int", _) =>
+        exprSize(expr) <= 3 &&
+          localIntegerExpr(expr) &&
+          !containsIntegerDivOrMod(expr) &&
+          !containsShiftOrMask(expr)
       case _ => false
     }
 
@@ -4043,6 +4135,30 @@ object CleanGeneratedKernelBody {
     if (integerPure(expr) && !atomic(expr)) expr +: children else children
   }
 
+  private def collectIntegerSubexprs(stmt: Stmt): Seq[Expr] =
+    stmt match {
+      case Block(body) =>
+        body.flatMap(collectIntegerSubexprs)
+      case Stmts(a, b) =>
+        collectIntegerSubexprs(a) ++ collectIntegerSubexprs(b)
+      case DeclStmt(VarDecl(_, _, init)) =>
+        init.toSeq.flatMap(collectIntegerSubexprs)
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        collectIntegerSubexprs(lhs) ++ collectIntegerSubexprs(rhs)
+      case ExprStmt(expr) =>
+        collectIntegerSubexprs(expr)
+      case ForLoop(init, cond, increment, body) =>
+        collectIntegerSubexprs(init) ++ collectIntegerSubexprs(cond) ++
+          collectIntegerSubexprs(increment) ++ collectIntegerSubexprs(body)
+      case WhileLoop(cond, body) =>
+        collectIntegerSubexprs(cond) ++ collectIntegerSubexprs(body)
+      case IfThenElse(cond, trueBody, falseBody) =>
+        collectIntegerSubexprs(cond) ++ collectIntegerSubexprs(trueBody) ++
+          falseBody.toSeq.flatMap(collectIntegerSubexprs)
+      case _ =>
+        Seq.empty
+    }
+
   private def replaceExpr(expr: Expr, target: Expr, replacement: Expr): Expr =
     if (sameExpr(expr, target)) {
       replacement
@@ -4068,6 +4184,46 @@ object CleanGeneratedKernelBody {
         case other =>
           other
       }
+    }
+
+  private def replaceExprInStmt(stmt: Stmt, target: Expr, replacement: Expr): Stmt =
+    stmt match {
+      case Block(body) =>
+        Block(body.map(replaceExprInStmt(_, target, replacement)))
+      case Stmts(a, b) =>
+        Stmts(
+          replaceExprInStmt(a, target, replacement),
+          replaceExprInStmt(b, target, replacement)
+        )
+      case DeclStmt(v @ VarDecl(_, _, init)) =>
+        DeclStmt(withInit(v, init.map(replaceExpr(_, target, replacement))))
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        ExprStmt(Assignment(
+          replaceExpr(lhs, target, replacement),
+          replaceExpr(rhs, target, replacement)
+        ))
+      case ExprStmt(expr) =>
+        ExprStmt(replaceExpr(expr, target, replacement))
+      case ForLoop(init, cond, increment, body) =>
+        ForLoop(
+          replaceExprInStmt(init, target, replacement).asInstanceOf[DeclStmt],
+          replaceExpr(cond, target, replacement),
+          replaceExpr(increment, target, replacement),
+          replaceExprInStmt(body, target, replacement).asInstanceOf[Block]
+        )
+      case WhileLoop(cond, body) =>
+        WhileLoop(
+          replaceExpr(cond, target, replacement),
+          replaceExprInStmt(body, target, replacement)
+        )
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          replaceExpr(cond, target, replacement),
+          replaceExprInStmt(trueBody, target, replacement),
+          falseBody.map(replaceExprInStmt(_, target, replacement))
+        )
+      case other =>
+        other
     }
 
   private def exprSize(expr: Expr): Int =
@@ -4104,8 +4260,11 @@ object CleanGeneratedKernelBody {
     }
 
   private case class StructuralIntegerCseCost(decodeOps: Int, nodeCount: Int) {
-    def strictlyBetterThan(other: StructuralIntegerCseCost): Boolean =
-      decodeOps < other.decodeOps && nodeCount <= other.nodeCount
+    def strictlyBetterThan(other: StructuralIntegerCseCost): Boolean = {
+      val decodeSavings = other.decodeOps - decodeOps
+      val nodeIncrease = nodeCount - other.nodeCount
+      decodeSavings > 0 && (nodeIncrease <= 0 || decodeSavings * 6 >= nodeIncrease)
+    }
   }
 
   private def structuralIntegerCseCost(stmt: Stmt): StructuralIntegerCseCost =
