@@ -334,15 +334,44 @@ object CleanGeneratedKernelBody {
     }
 
   private def splitTernaryAssignment(lhs: Expr, rhs: Expr): Stmt =
-    rhs match {
-      case TernaryExpr(cond, thenE, elseE) =>
-        IfThenElse(
-          cond,
-          blockOrStmt(Seq(splitTernaryAssignment(lhs, thenE))),
-          Some(blockOrStmt(Seq(splitTernaryAssignment(lhs, elseE))))
-        )
-      case _ =>
+    firstTernary(rhs) match {
+      case Some(ternary) =>
+        ternary match {
+          case TernaryExpr(cond, thenE, elseE) =>
+            IfThenElse(
+              cond,
+              blockOrStmt(Seq(splitTernaryAssignment(
+                lhs,
+                replaceExpr(rhs, ternary, thenE)))),
+              Some(blockOrStmt(Seq(splitTernaryAssignment(
+                lhs,
+                replaceExpr(rhs, ternary, elseE)))))
+            )
+        }
+      case None =>
         ExprStmt(Assignment(lhs, rhs))
+    }
+
+  private def firstTernary(expr: Expr): Option[TernaryExpr] =
+    expr match {
+      case ternary: TernaryExpr =>
+        Some(ternary)
+      case BinaryExpr(lhs, _, rhs) =>
+        firstTernary(lhs).orElse(firstTernary(rhs))
+      case UnaryExpr(_, e) =>
+        firstTernary(e)
+      case ArraySubscript(array, index) =>
+        firstTernary(array).orElse(firstTernary(index))
+      case StructMemberAccess(struct, _) =>
+        firstTernary(struct)
+      case FunCall(fun, args) =>
+        firstTernary(fun).orElse(args.iterator.flatMap(firstTernary).toSeq.headOption)
+      case Cast(_, e) =>
+        firstTernary(e)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.iterator.flatMap(firstTernary).toSeq.headOption
+      case _ =>
+        None
     }
 
   private def ternaryCount(expr: Expr): Int =
