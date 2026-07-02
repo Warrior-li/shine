@@ -93,7 +93,20 @@ object CleanGeneratedKernelBody {
       inlineSingleUseScalarDecls(inlineLiteralIntDecls(arraySelectEliminated)))
     val splitTernaries = splitLargeTernaryAssignments(finalInlined)
     val branchLhsHoisted = hoistCommonBranchAssignmentLhsIndices(splitTernaries)
-    flattenTrivialBlocks(simplifyKnownBranchConditions(branchLhsHoisted))
+    val branchIntegerFactored = factorRepeatedIntegerExprs(branchLhsHoisted)
+    val branchIntegerReused = reuseKnownIntegerSubexpressions(branchIntegerFactored)
+    val branchOriginalSimplified =
+      simplifyStatements(simplifyExpressions(branchLhsHoisted))
+    val branchCandidateSimplified =
+      simplifyStatements(simplifyExpressions(branchIntegerReused))
+    val branchDecodeReduced =
+      if (structuralIntegerCseCost(branchCandidateSimplified).strictlyBetterThan(
+          structuralIntegerCseCost(branchOriginalSimplified))) {
+        branchCandidateSimplified
+      } else {
+        branchLhsHoisted
+      }
+    flattenTrivialBlocks(simplifyKnownBranchConditions(branchDecodeReduced))
   }
 
   private case class BranchFact(value: Boolean, refs: Set[String])
@@ -4088,6 +4101,114 @@ object CleanGeneratedKernelBody {
         containsIntegerDivOrMod(e)
       case _ =>
         false
+    }
+
+  private case class StructuralIntegerCseCost(decodeOps: Int, nodeCount: Int) {
+    def strictlyBetterThan(other: StructuralIntegerCseCost): Boolean =
+      decodeOps < other.decodeOps && nodeCount <= other.nodeCount
+  }
+
+  private def structuralIntegerCseCost(stmt: Stmt): StructuralIntegerCseCost =
+    StructuralIntegerCseCost(
+      decodeOps = integerDecodeOpCount(stmt),
+      nodeCount = astNodeCount(stmt)
+    )
+
+  private def integerDecodeOpCount(stmt: Stmt): Int =
+    stmt match {
+      case Block(body) =>
+        body.map(integerDecodeOpCount).sum
+      case Stmts(a, b) =>
+        integerDecodeOpCount(a) + integerDecodeOpCount(b)
+      case DeclStmt(VarDecl(_, _, init)) =>
+        init.map(integerDecodeOpCount).getOrElse(0)
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        integerDecodeOpCount(lhs) + integerDecodeOpCount(rhs)
+      case ExprStmt(expr) =>
+        integerDecodeOpCount(expr)
+      case ForLoop(init, cond, increment, body) =>
+        integerDecodeOpCount(init) + integerDecodeOpCount(cond) +
+          integerDecodeOpCount(increment) + integerDecodeOpCount(body)
+      case WhileLoop(cond, body) =>
+        integerDecodeOpCount(cond) + integerDecodeOpCount(body)
+      case IfThenElse(cond, trueBody, falseBody) =>
+        integerDecodeOpCount(cond) + integerDecodeOpCount(trueBody) +
+          falseBody.map(integerDecodeOpCount).getOrElse(0)
+      case _ =>
+        0
+    }
+
+  private def integerDecodeOpCount(expr: Expr): Int =
+    expr match {
+      case BinaryExpr(lhs, BinaryOperator./, rhs) =>
+        1 + integerDecodeOpCount(lhs) + integerDecodeOpCount(rhs)
+      case BinaryExpr(lhs, BinaryOperator.%, rhs) =>
+        1 + integerDecodeOpCount(lhs) + integerDecodeOpCount(rhs)
+      case BinaryExpr(lhs, _, rhs) =>
+        integerDecodeOpCount(lhs) + integerDecodeOpCount(rhs)
+      case UnaryExpr(_, e) =>
+        integerDecodeOpCount(e)
+      case TernaryExpr(cond, thenE, elseE) =>
+        integerDecodeOpCount(cond) + integerDecodeOpCount(thenE) +
+          integerDecodeOpCount(elseE)
+      case ArraySubscript(array, index) =>
+        integerDecodeOpCount(array) + integerDecodeOpCount(index)
+      case StructMemberAccess(struct, _) =>
+        integerDecodeOpCount(struct)
+      case FunCall(fun, args) =>
+        integerDecodeOpCount(fun) + args.map(integerDecodeOpCount).sum
+      case Cast(_, e) =>
+        integerDecodeOpCount(e)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.map(integerDecodeOpCount).sum
+      case _ =>
+        0
+    }
+
+  private def astNodeCount(stmt: Stmt): Int =
+    stmt match {
+      case Block(body) =>
+        1 + body.map(astNodeCount).sum
+      case Stmts(a, b) =>
+        1 + astNodeCount(a) + astNodeCount(b)
+      case DeclStmt(VarDecl(_, _, init)) =>
+        1 + init.map(astNodeCount).getOrElse(0)
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        1 + astNodeCount(lhs) + astNodeCount(rhs)
+      case ExprStmt(expr) =>
+        1 + astNodeCount(expr)
+      case ForLoop(init, cond, increment, body) =>
+        1 + astNodeCount(init) + astNodeCount(cond) +
+          astNodeCount(increment) + astNodeCount(body)
+      case WhileLoop(cond, body) =>
+        1 + astNodeCount(cond) + astNodeCount(body)
+      case IfThenElse(cond, trueBody, falseBody) =>
+        1 + astNodeCount(cond) + astNodeCount(trueBody) +
+          falseBody.map(astNodeCount).getOrElse(0)
+      case _ =>
+        1
+    }
+
+  private def astNodeCount(expr: Expr): Int =
+    expr match {
+      case BinaryExpr(lhs, _, rhs) =>
+        1 + astNodeCount(lhs) + astNodeCount(rhs)
+      case UnaryExpr(_, e) =>
+        1 + astNodeCount(e)
+      case TernaryExpr(cond, thenE, elseE) =>
+        1 + astNodeCount(cond) + astNodeCount(thenE) + astNodeCount(elseE)
+      case ArraySubscript(array, index) =>
+        1 + astNodeCount(array) + astNodeCount(index)
+      case StructMemberAccess(struct, _) =>
+        1 + astNodeCount(struct)
+      case FunCall(fun, args) =>
+        1 + astNodeCount(fun) + args.map(astNodeCount).sum
+      case Cast(_, e) =>
+        1 + astNodeCount(e)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        1 + values.map(astNodeCount).sum
+      case _ =>
+        1
     }
 
   private def containsShiftOrMask(expr: Expr): Boolean =
