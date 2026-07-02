@@ -92,7 +92,8 @@ object CleanGeneratedKernelBody {
     val finalInlined = pruneUnusedScalarDecls(
       inlineSingleUseScalarDecls(inlineLiteralIntDecls(arraySelectEliminated)))
     val splitTernaries = splitLargeTernaryAssignments(finalInlined)
-    flattenTrivialBlocks(simplifyKnownBranchConditions(splitTernaries))
+    val branchLhsHoisted = hoistCommonBranchAssignmentLhsIndices(splitTernaries)
+    flattenTrivialBlocks(simplifyKnownBranchConditions(branchLhsHoisted))
   }
 
   private case class BranchFact(value: Boolean, refs: Set[String])
@@ -196,6 +197,137 @@ object CleanGeneratedKernelBody {
              ternaryCount(rhs) > 0 &&
              exprSize(rhs) > MaxInlineTernaryAssignmentExprSize =>
         splitTernaryAssignment(lhs, rhs)
+
+      case other =>
+        other
+    }
+
+  private def hoistCommonBranchAssignmentLhsIndices(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        body.foreach(collectDeclNames(_, usedNames))
+        Block(body.flatMap(s => flatten(hoistCommonBranchAssignmentLhsIndex(s, usedNames))))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistCommonBranchAssignmentLhsIndices(a),
+          hoistCommonBranchAssignmentLhsIndices(b))))
+
+      case ForLoop(init, cond, bodyUpdate, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, bodyUpdate,
+          hoistCommonBranchAssignmentLhsIndices(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistCommonBranchAssignmentLhsIndices(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistCommonBranchAssignmentLhsIndices(trueBody),
+          falseBody.map(hoistCommonBranchAssignmentLhsIndices))
+
+      case other =>
+        other
+    }
+
+  private def hoistCommonBranchAssignmentLhsIndex(
+      stmt: Stmt,
+      usedNames: scala.collection.mutable.Set[String]
+    ): Stmt =
+    stmt match {
+      case branch @ IfThenElse(_, _, _) =>
+        commonArrayAssignmentLhs(branch) match {
+          case Some((array, index)) if pure(index) && exprSize(index) >= 8 =>
+            val tmp = freshName("_np_lhs_idx", usedNames)
+            Block(Seq(
+              DeclStmt(VarDecl(tmp, Type.int, Some(index))),
+              rewriteCommonArrayAssignmentLhs(branch, array, index, DeclRef(tmp))
+            ))
+          case _ =>
+            hoistCommonBranchAssignmentLhsIndices(branch)
+        }
+      case other =>
+        hoistCommonBranchAssignmentLhsIndices(other)
+    }
+
+  private def commonArrayAssignmentLhs(stmt: Stmt): Option[(Expr, Expr)] =
+    stmt match {
+      case ExprStmt(Assignment(ArraySubscript(array, index), _)) =>
+        Some(array -> index)
+
+      case Block(body) =>
+        body.filterNot(flatten(_).isEmpty) match {
+          case Seq(single) => commonArrayAssignmentLhs(single)
+          case _ => None
+        }
+
+      case Stmts(a, b) =>
+        flatten(Stmts(a, b)).filterNot(flatten(_).isEmpty) match {
+          case Seq(single) => commonArrayAssignmentLhs(single)
+          case _ => None
+        }
+
+      case IfThenElse(_, trueBody, Some(falseBody)) =>
+        (commonArrayAssignmentLhs(trueBody), commonArrayAssignmentLhs(falseBody)) match {
+          case (Some((arrayA, indexA)), Some((arrayB, indexB)))
+              if sameExpr(arrayA, arrayB) && sameExpr(indexA, indexB) =>
+            Some(arrayA -> indexA)
+          case _ =>
+            None
+        }
+
+      case _ =>
+        None
+    }
+
+  private def rewriteCommonArrayAssignmentLhs(
+      stmt: Stmt,
+      targetArray: Expr,
+      targetIndex: Expr,
+      replacementIndex: Expr
+    ): Stmt =
+    stmt match {
+      case ExprStmt(Assignment(ArraySubscript(array, index), rhs))
+          if sameExpr(array, targetArray) && sameExpr(index, targetIndex) =>
+        ExprStmt(Assignment(ArraySubscript(array, replacementIndex), rhs))
+
+      case Block(body) =>
+        Block(body.map(rewriteCommonArrayAssignmentLhs(
+          _,
+          targetArray,
+          targetIndex,
+          replacementIndex)))
+
+      case Stmts(a, b) =>
+        Stmts(
+          rewriteCommonArrayAssignmentLhs(a, targetArray, targetIndex, replacementIndex),
+          rewriteCommonArrayAssignmentLhs(b, targetArray, targetIndex, replacementIndex))
+
+      case ForLoop(init, cond, increment, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, increment,
+          rewriteCommonArrayAssignmentLhs(
+            body,
+            targetArray,
+            targetIndex,
+            replacementIndex).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, rewriteCommonArrayAssignmentLhs(
+          body,
+          targetArray,
+          targetIndex,
+          replacementIndex))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          rewriteCommonArrayAssignmentLhs(trueBody, targetArray, targetIndex, replacementIndex),
+          falseBody.map(rewriteCommonArrayAssignmentLhs(
+            _,
+            targetArray,
+            targetIndex,
+            replacementIndex)))
 
       case other =>
         other
@@ -3630,8 +3762,9 @@ object CleanGeneratedKernelBody {
         val (temps, rewrittenInit) = factorExprIntoIntegerTemps(init, usedNames)
         temps :+ DeclStmt(VarDecl(name, t, Some(rewrittenInit)))
       case ExprStmt(Assignment(lhs, rhs)) =>
-        val (temps, rewrittenRhs) = factorExprIntoIntegerTemps(rhs, usedNames)
-        temps :+ ExprStmt(Assignment(lhs, rewrittenRhs))
+        val (lhsTemps, rewrittenLhs) = factorExprIntoIntegerTemps(lhs, usedNames)
+        val (rhsTemps, rewrittenRhs) = factorExprIntoIntegerTemps(rhs, usedNames)
+        lhsTemps ++ rhsTemps :+ ExprStmt(Assignment(rewrittenLhs, rewrittenRhs))
       case _ =>
         Seq(stmt)
     }
@@ -3858,6 +3991,8 @@ object CleanGeneratedKernelBody {
           collectIntegerSubexprs(elseE)
       case ArraySubscript(_, index) =>
         collectIntegerSubexprs(index)
+      case FunCall(fun, args) =>
+        collectIntegerSubexprs(fun) ++ args.flatMap(collectIntegerSubexprs)
       case Cast(_, e) =>
         collectIntegerSubexprs(e)
       case _ =>
@@ -3884,6 +4019,8 @@ object CleanGeneratedKernelBody {
           )
         case ArraySubscript(array, index) =>
           ArraySubscript(array, replaceExpr(index, target, replacement))
+        case FunCall(fun, args) =>
+          FunCall(fun, args.map(replaceExpr(_, target, replacement)))
         case Cast(t, e) =>
           Cast(t, replaceExpr(e, target, replacement))
         case other =>
@@ -3898,6 +4035,7 @@ object CleanGeneratedKernelBody {
       case TernaryExpr(cond, thenE, elseE) =>
         1 + exprSize(cond) + exprSize(thenE) + exprSize(elseE)
       case ArraySubscript(_, index) => 1 + exprSize(index)
+      case FunCall(fun, args) => 1 + exprSize(fun) + args.map(exprSize).sum
       case Cast(_, e) => 1 + exprSize(e)
       case _ => 1
     }
@@ -3915,6 +4053,8 @@ object CleanGeneratedKernelBody {
           containsIntegerDivOrMod(elseE)
       case ArraySubscript(_, index) =>
         containsIntegerDivOrMod(index)
+      case FunCall(fun, args) =>
+        containsIntegerDivOrMod(fun) || args.exists(containsIntegerDivOrMod)
       case Cast(_, e) =>
         containsIntegerDivOrMod(e)
       case _ =>
@@ -3934,6 +4074,8 @@ object CleanGeneratedKernelBody {
           containsShiftOrMask(elseE)
       case ArraySubscript(_, index) =>
         containsShiftOrMask(index)
+      case FunCall(fun, args) =>
+        containsShiftOrMask(fun) || args.exists(containsShiftOrMask)
       case Cast(_, e) =>
         containsShiftOrMask(e)
       case _ =>
@@ -3943,6 +4085,8 @@ object CleanGeneratedKernelBody {
   private def integerPure(expr: Expr): Boolean =
     expr match {
       case _: Literal | _: DeclRef | _: ArithmeticExpr => true
+      case FunCall(DeclRef(name), args) if pureOpenCLQuery(name) =>
+        args.forall(integerPure)
       case UnaryExpr(UnaryOperator.!, e) => integerPure(e)
       case UnaryExpr(UnaryOperator.-, e) => integerPure(e)
       case BinaryExpr(lhs, op, rhs) if integerOperator(op) =>
@@ -3969,6 +4113,8 @@ object CleanGeneratedKernelBody {
   private def atomic(expr: Expr): Boolean =
     expr match {
       case _: Literal | _: DeclRef | _: ArithmeticExpr => true
+      case FunCall(DeclRef(name), args) if pureOpenCLQuery(name) =>
+        args.forall(atomic)
       case _ => false
     }
 
