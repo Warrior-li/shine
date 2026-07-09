@@ -95,25 +95,38 @@ object CleanGeneratedKernelBody {
       inlineSingleUseScalarDecls(inlineLiteralIntDecls(arraySelectEliminated)))
     val splitTernaries = splitLargeTernaryAssignments(finalInlined)
     val branchLhsHoisted = hoistCommonBranchAssignmentLhsIndices(splitTernaries)
-    val branchBlockIntegerHoisted = hoistFrequentIntegerSubexprs(branchLhsHoisted)
-    val branchIntegerFactored = factorRepeatedIntegerExprs(branchBlockIntegerHoisted)
+    val branchIndexBaseHoisted = hoistLoopScopeArrayIndexBases(branchLhsHoisted)
+    val branchBlockIntegerHoisted = hoistFrequentIntegerSubexprs(branchIndexBaseHoisted)
+    val branchLeadingIntegerHoisted =
+      hoistFrequentIntegerSubexprsAfterLeadingIntDecls(branchBlockIntegerHoisted)
+    val branchIntegerFactored = factorRepeatedIntegerExprs(branchLeadingIntegerHoisted)
     val branchIntegerReused = reuseKnownIntegerSubexpressions(branchIntegerFactored)
+    val branchRangeSimplified = simplifyIntegerExpressionsWithRanges(
+      branchIntegerReused,
+      workGroupRanges(wgConfig),
+      localIdRanges(wgConfig))
     val branchOriginalSimplified =
       simplifyStatements(simplifyExpressions(branchLhsHoisted))
     val branchCandidateSimplified =
-      simplifyStatements(simplifyExpressions(branchIntegerReused))
+      simplifyStatements(simplifyExpressions(branchRangeSimplified))
     val branchDecodeReduced =
       if (structuralIntegerCseCost(branchCandidateSimplified).strictlyBetterThan(
           structuralIntegerCseCost(branchOriginalSimplified))) {
         branchCandidateSimplified
       } else {
         branchLhsHoisted
-      }
+    }
     val finalTernariesSplit = splitLargeTernaryAssignments(branchDecodeReduced)
-    val lhsIndexHoisted = hoistLongArrayAssignmentLhsIndices(finalTernariesSplit)
+    val rhsIndexHoisted = hoistLongArrayReadIndices(finalTernariesSplit)
+    val rhsIndexIntegerReused = reuseKnownIntegerSubexpressions(
+      factorRepeatedIntegerExprs(hoistFrequentIntegerSubexprs(rhsIndexHoisted)))
+    val lhsIndexHoisted = hoistLongArrayAssignmentLhsIndices(rhsIndexIntegerReused)
     val fallbackTernariesSplit = splitLargeTernaryAssignments(branchLhsHoisted)
+    val fallbackRhsIndexHoisted = hoistLongArrayReadIndices(fallbackTernariesSplit)
+    val fallbackRhsIndexIntegerReused = reuseKnownIntegerSubexpressions(
+      factorRepeatedIntegerExprs(hoistFrequentIntegerSubexprs(fallbackRhsIndexHoisted)))
     val fallbackLhsIndexHoisted =
-      hoistLongArrayAssignmentLhsIndices(fallbackTernariesSplit)
+      hoistLongArrayAssignmentLhsIndices(fallbackRhsIndexIntegerReused)
     Seq(
       flattenTrivialBlocks(simplifyKnownBranchConditions(lhsIndexHoisted)),
       flattenTrivialBlocks(lhsIndexHoisted),
@@ -337,6 +350,160 @@ object CleanGeneratedKernelBody {
   private def longInlineArrayIndex(index: Expr): Boolean =
     cPrinterKey(index).exists(_.length > MaxInlineArrayLhsIndexLength) ||
       exprSize(index) > 48
+
+  private def hoistLongArrayReadIndices(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        body.foreach(collectDeclNames(_, usedNames))
+        Block(body.flatMap(s => flatten(hoistLongArrayReadIndices(s, usedNames))))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistLongArrayReadIndices(a),
+          hoistLongArrayReadIndices(b))))
+
+      case ForLoop(init, cond, bodyUpdate, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, bodyUpdate,
+          hoistLongArrayReadIndices(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistLongArrayReadIndices(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistLongArrayReadIndices(trueBody),
+          falseBody.map(hoistLongArrayReadIndices))
+
+      case other =>
+        hoistLongArrayReadIndices(
+          other,
+          scala.collection.mutable.Set.empty[String])
+    }
+
+  private def hoistLongArrayReadIndices(
+      stmt: Stmt,
+      usedNames: scala.collection.mutable.Set[String]
+    ): Stmt =
+    stmt match {
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        val candidates = longArrayReadIndexCandidates(rhs)
+          .filter(pure)
+          .filter(inlineArrayReadIndexWorthHoisting)
+          .groupBy(exprKey)
+          .values
+          .flatMap(_.headOption)
+          .toSeq
+          .sortBy(e => (-exprSize(e), exprKey(e)))
+          .take(MaxIntegerCseTempsPerStatement)
+
+        if (candidates.isEmpty) {
+          stmt
+        } else {
+          var rewrittenRhs = rhs
+          val temps = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+          candidates.foreach { index =>
+            if (containsExpr(rewrittenRhs, index)) {
+              val tmp = freshName("_np_rhs_idx", usedNames)
+              temps += DeclStmt(VarDecl(tmp, Type.int, Some(index)))
+              rewrittenRhs = replaceExpr(rewrittenRhs, index, DeclRef(tmp))
+            }
+          }
+          if (temps.isEmpty) {
+            stmt
+          } else {
+            Block(temps.toSeq :+ ExprStmt(Assignment(lhs, rewrittenRhs)))
+          }
+        }
+
+      case Block(body) =>
+        Block(body.flatMap(s => flatten(hoistLongArrayReadIndices(s, usedNames))))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistLongArrayReadIndices(a, usedNames),
+          hoistLongArrayReadIndices(b, usedNames))))
+
+      case ForLoop(init, cond, bodyUpdate, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, bodyUpdate,
+          hoistLongArrayReadIndices(body, usedNames).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistLongArrayReadIndices(body, usedNames))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistLongArrayReadIndices(trueBody, usedNames),
+          falseBody.map(hoistLongArrayReadIndices(_, usedNames)))
+
+      case other =>
+        other
+    }
+
+  private def longArrayReadIndexCandidates(expr: Expr): Seq[Expr] =
+    expr match {
+      case ArraySubscript(array, index) =>
+        longArrayReadIndexCandidates(array) ++
+          longArrayReadIndexCandidates(index) ++
+          Seq(index)
+      case BinaryExpr(lhs, _, rhs) =>
+        longArrayReadIndexCandidates(lhs) ++ longArrayReadIndexCandidates(rhs)
+      case UnaryExpr(_, e) =>
+        longArrayReadIndexCandidates(e)
+      case TernaryExpr(cond, thenE, elseE) =>
+        longArrayReadIndexCandidates(cond) ++
+          longArrayReadIndexCandidates(thenE) ++
+          longArrayReadIndexCandidates(elseE)
+      case FunCall(fun, args) =>
+        longArrayReadIndexCandidates(fun) ++
+          args.flatMap(longArrayReadIndexCandidates)
+      case Cast(_, e) =>
+        longArrayReadIndexCandidates(e)
+      case StructMemberAccess(struct, member) =>
+        longArrayReadIndexCandidates(struct) ++ longArrayReadIndexCandidates(member)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.flatMap(longArrayReadIndexCandidates)
+      case shine.OpenCL.AST.VectorSubscript(vector, index) =>
+        longArrayReadIndexCandidates(vector) ++ longArrayReadIndexCandidates(index)
+      case _ =>
+        Seq.empty
+    }
+
+  private def inlineArrayReadIndexWorthHoisting(index: Expr): Boolean =
+    cPrinterKey(index).exists(_.length > 80) ||
+      exprSize(index) >= 16 ||
+      containsIntegerDivOrMod(index) ||
+      containsShiftOrMask(index)
+
+  private def containsExpr(expr: Expr, target: Expr): Boolean =
+    sameExpr(expr, target) || (expr match {
+      case BinaryExpr(lhs, _, rhs) =>
+        containsExpr(lhs, target) || containsExpr(rhs, target)
+      case UnaryExpr(_, e) =>
+        containsExpr(e, target)
+      case TernaryExpr(cond, thenE, elseE) =>
+        containsExpr(cond, target) || containsExpr(thenE, target) ||
+          containsExpr(elseE, target)
+      case ArraySubscript(array, index) =>
+        containsExpr(array, target) || containsExpr(index, target)
+      case FunCall(fun, args) =>
+        containsExpr(fun, target) || args.exists(containsExpr(_, target))
+      case Cast(_, e) =>
+        containsExpr(e, target)
+      case StructMemberAccess(struct, member) =>
+        containsExpr(struct, target) || containsExpr(member, target)
+      case shine.OpenCL.AST.VectorLiteral(_, values) =>
+        values.exists(containsExpr(_, target))
+      case shine.OpenCL.AST.VectorSubscript(vector, index) =>
+        containsExpr(vector, target) || containsExpr(index, target)
+      case _ =>
+        false
+    })
+
+  private def exprKey(expr: Expr): String =
+    cPrinterKey(expr).getOrElse(expr.toString)
 
   private def hoistCommonBranchAssignmentLhsIndex(
       stmt: Stmt,
@@ -1101,6 +1268,7 @@ object CleanGeneratedKernelBody {
         val initDecl = init.asInstanceOf[DeclStmt]
         val loopRanges = loopRange(initDecl, cond)
           .orElse(localIdStartedLoopRange(initDecl, cond, localRanges))
+          .orElse(nonNegativeStartedLoopRange(initDecl, cond, increment))
           .map { case (name, range) => ranges + (name -> range) }
           .getOrElse(ranges)
         val (rewrittenBody, _) =
@@ -1257,6 +1425,46 @@ object CleanGeneratedKernelBody {
       case _ =>
         None
     }
+
+  private def nonNegativeStartedLoopRange(
+      init: DeclStmt,
+      cond: Expr,
+      increment: Expr
+    ): Option[(String, IntRange)] =
+    (init, cond) match {
+      case (
+          DeclStmt(VarDecl(name, BasicType("int", _), Some(start))),
+          BinaryExpr(DeclRef(condName), BinaryOperator.<, end)
+        ) if name == condName && nonNegativeLoopStart(start) &&
+          loopStepNonNegative(name, increment) =>
+        constInt(end).filter(_ >= 0).map(hi => name -> IntRange(0, hi))
+      case _ =>
+        None
+    }
+
+  private def nonNegativeLoopStart(expr: Expr): Boolean =
+    constInt(expr).exists(_ >= 0) || (expr match {
+      case globalIdCall(_) | localIdCall(_) | groupIdCall(_) => true
+      case _ => false
+    })
+
+  private def loopStepNonNegative(name: String, expr: Expr): Boolean =
+    expr match {
+      case Assignment(DeclRef(lhs), BinaryExpr(DeclRef(rhs), BinaryOperator.+, step))
+          if lhs == name && rhs == name =>
+        nonNegativeLoopStep(step)
+      case Assignment(DeclRef(lhs), BinaryExpr(step, BinaryOperator.+, DeclRef(rhs)))
+          if lhs == name && rhs == name =>
+        nonNegativeLoopStep(step)
+      case _ =>
+        false
+    }
+
+  private def nonNegativeLoopStep(expr: Expr): Boolean =
+    constInt(expr).exists(_ >= 0) || (expr match {
+      case globalSizeCall(_) | localSizeCall(_) => true
+      case _ => false
+    })
 
   private def simplifyIntegerExprWithContext(
       expr: Expr,
@@ -2126,6 +2334,44 @@ object CleanGeneratedKernelBody {
       }
   }
 
+  private object globalIdCall {
+    def unapply(expr: Expr): Option[Int] =
+      expr match {
+        case FunCall(DeclRef("get_global_id"), Seq(Literal(text))) =>
+          text.toIntOption
+        case FunCall(DeclRef("get_global_id"), Seq(ArithmeticExpr(Cst(value)))) =>
+          Some(value.toInt)
+        case ArithmeticExpr(b: BuiltInFunctionCall)
+            if b.toString == s"get_global_id(${b.param})" =>
+          Some(b.param)
+        case ArithmeticExpr(ae) if ae.toString.startsWith("get_global_id(") =>
+          ae.toString.stripPrefix("get_global_id(").stripSuffix(")").toIntOption
+        case Literal(text) if text.startsWith("get_global_id(") =>
+          text.stripPrefix("get_global_id(").stripSuffix(")").toIntOption
+        case _ =>
+          None
+      }
+  }
+
+  private object groupIdCall {
+    def unapply(expr: Expr): Option[Int] =
+      expr match {
+        case FunCall(DeclRef("get_group_id"), Seq(Literal(text))) =>
+          text.toIntOption
+        case FunCall(DeclRef("get_group_id"), Seq(ArithmeticExpr(Cst(value)))) =>
+          Some(value.toInt)
+        case ArithmeticExpr(b: BuiltInFunctionCall)
+            if b.toString == s"get_group_id(${b.param})" =>
+          Some(b.param)
+        case ArithmeticExpr(ae) if ae.toString.startsWith("get_group_id(") =>
+          ae.toString.stripPrefix("get_group_id(").stripSuffix(")").toIntOption
+        case Literal(text) if text.startsWith("get_group_id(") =>
+          text.stripPrefix("get_group_id(").stripSuffix(")").toIntOption
+        case _ =>
+          None
+      }
+  }
+
   private def incrementsByLocalSize(name: String, dim: Int, expr: Expr): Boolean =
     expr match {
       case Assignment(DeclRef(lhs), BinaryExpr(DeclRef(rhs), BinaryOperator.+, localSizeCall(`dim`)))
@@ -2149,6 +2395,25 @@ object CleanGeneratedKernelBody {
           ae.toString.stripPrefix("get_local_size(").stripSuffix(")").toIntOption
         case Literal(text) if text.startsWith("get_local_size(") =>
           text.stripPrefix("get_local_size(").stripSuffix(")").toIntOption
+        case _ =>
+          None
+      }
+  }
+
+  private object globalSizeCall {
+    def unapply(expr: Expr): Option[Int] =
+      expr match {
+        case FunCall(DeclRef("get_global_size"), Seq(Literal(text))) =>
+          text.toIntOption
+        case FunCall(DeclRef("get_global_size"), Seq(ArithmeticExpr(Cst(value)))) =>
+          Some(value.toInt)
+        case ArithmeticExpr(b: BuiltInFunctionCall)
+            if b.toString == s"get_global_size(${b.param})" =>
+          Some(b.param)
+        case ArithmeticExpr(ae) if ae.toString.startsWith("get_global_size(") =>
+          ae.toString.stripPrefix("get_global_size(").stripSuffix(")").toIntOption
+        case Literal(text) if text.startsWith("get_global_size(") =>
+          text.stripPrefix("get_global_size(").stripSuffix(")").toIntOption
         case _ =>
           None
       }
@@ -3576,6 +3841,83 @@ object CleanGeneratedKernelBody {
         other
     }
 
+  private def hoistFrequentIntegerSubexprsAfterLeadingIntDecls(stmt: Stmt): Stmt =
+    stmt match {
+      case Block(body) =>
+        val recursivelyCleaned =
+          body.map(hoistFrequentIntegerSubexprsAfterLeadingIntDecls)
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        recursivelyCleaned.foreach(collectDeclNames(_, usedNames))
+        Block(hoistFrequentIntegerSubexprsAfterLeadingIntDeclsInBlock(
+          recursivelyCleaned,
+          usedNames))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistFrequentIntegerSubexprsAfterLeadingIntDecls(a),
+          hoistFrequentIntegerSubexprsAfterLeadingIntDecls(b)
+        )))
+
+      case ForLoop(init, cond, increment, body) =>
+        ForLoop(init.asInstanceOf[DeclStmt], cond, increment,
+          hoistFrequentIntegerSubexprsAfterLeadingIntDecls(body).asInstanceOf[Block])
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistFrequentIntegerSubexprsAfterLeadingIntDecls(body))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistFrequentIntegerSubexprsAfterLeadingIntDecls(trueBody),
+          falseBody.map(hoistFrequentIntegerSubexprsAfterLeadingIntDecls))
+
+      case other =>
+        other
+    }
+
+  private def hoistFrequentIntegerSubexprsAfterLeadingIntDeclsInBlock(
+      body: Seq[Stmt],
+      usedNames: scala.collection.mutable.Set[String]
+    ): Seq[Stmt] = {
+    val prefixLen = body.indexWhere {
+      case DeclStmt(VarDecl(_, BasicType("int", _), Some(init))) if pure(init) =>
+        false
+      case _ =>
+        true
+    } match {
+      case -1 => body.length
+      case n => n
+    }
+    if (prefixLen == 0 || prefixLen >= body.length) {
+      body
+    } else {
+      val prefix = body.take(prefixLen)
+      var suffix = body.drop(prefixLen)
+      val temps = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+      var remaining = MaxIntegerCseTempsPerBlock
+
+      while (remaining > 0) {
+        val suffixDecls = scala.collection.mutable.Set.empty[String]
+        suffix.foreach(collectDeclNames(_, suffixDecls))
+        val suffixWrites = suffix.flatMap(assignedNames).toSet
+        chooseFrequentIntegerSubexpr(
+          suffix,
+          disallowedRefs = suffixDecls.toSet ++ suffixWrites
+        ) match {
+          case Some(candidate) =>
+            val tmp = freshName("_np_block_cse", usedNames)
+            temps += DeclStmt(VarDecl(tmp, Type.int, Some(candidate)))
+            suffix = suffix.map(replaceExprInStmt(_, candidate, DeclRef(tmp)))
+            remaining -= 1
+          case None =>
+            remaining = 0
+        }
+      }
+
+      prefix ++ temps.toSeq ++ suffix
+    }
+  }
+
   private def hoistFrequentIntegerSubexprsInBlock(
       body: Seq[Stmt],
       usedNames: scala.collection.mutable.Set[String]
@@ -3617,9 +3959,10 @@ object CleanGeneratedKernelBody {
     }
     counts.values.collect {
       case (e, count)
-          if count >= 6 &&
-             exprSize(e) >= 3 &&
-             (containsIntegerDivOrMod(e) || containsShiftOrMask(e)) &&
+          if (repeatedExpensiveIntegerOpCandidate(e, count) ||
+                (count >= 6 &&
+                  exprSize(e) >= 3 &&
+                  (containsIntegerDivOrMod(e) || containsShiftOrMask(e)))) &&
              collectDeclRefs(e).intersect(disallowedRefs).isEmpty =>
         (e, expensiveIntegerOpCseScore(e, count))
     }.toSeq
@@ -3627,6 +3970,163 @@ object CleanGeneratedKernelBody {
       .headOption
       .map(_._1)
   }
+
+  private def hoistLoopScopeArrayIndexBases(stmt: Stmt): Stmt =
+    hoistLoopScopeArrayIndexBases(stmt, stableRefs = Set.empty)
+
+  private def hoistLoopScopeArrayIndexBases(
+      stmt: Stmt,
+      stableRefs: Set[String]
+    ): Stmt =
+    stmt match {
+      case Block(body) =>
+        val usedNames = scala.collection.mutable.Set.empty[String]
+        body.foreach(collectDeclNames(_, usedNames))
+        val (temps, rewrittenBody) =
+          hoistArrayIndexBasesInBlock(body, stableRefs, usedNames)
+        Block(temps ++ rewrittenBody.map(hoistLoopScopeArrayIndexBases(_, stableRefs)))
+
+      case Stmts(a, b) =>
+        blockOrStmt(flatten(Stmts(
+          hoistLoopScopeArrayIndexBases(a, stableRefs),
+          hoistLoopScopeArrayIndexBases(b, stableRefs)
+        )))
+
+      case ForLoop(init, cond, increment, body) =>
+        val loopNames = declaredNames(init)
+        ForLoop(
+          init.asInstanceOf[DeclStmt],
+          cond,
+          increment,
+          hoistLoopScopeArrayIndexBases(
+            body,
+            stableRefs ++ loopNames
+          ).asInstanceOf[Block]
+        )
+
+      case WhileLoop(cond, body) =>
+        WhileLoop(cond, hoistLoopScopeArrayIndexBases(body, stableRefs))
+
+      case IfThenElse(cond, trueBody, falseBody) =>
+        IfThenElse(
+          cond,
+          hoistLoopScopeArrayIndexBases(trueBody, stableRefs),
+          falseBody.map(hoistLoopScopeArrayIndexBases(_, stableRefs))
+        )
+
+      case other =>
+        other
+    }
+
+  private def hoistArrayIndexBasesInBlock(
+      body: Seq[Stmt],
+      stableRefs: Set[String],
+      usedNames: scala.collection.mutable.Set[String]
+    ): (Seq[Stmt], Seq[Stmt]) = {
+    var current = body
+    val temps = scala.collection.mutable.ArrayBuffer.empty[Stmt]
+    var remaining = MaxIntegerCseTempsPerBlock
+    while (remaining > 0) {
+      chooseLoopScopeArrayIndexBase(
+        current,
+        stableRefs
+      ) match {
+        case Some(candidate) =>
+          val tmp = freshName("_np_index_cse", usedNames)
+          temps += DeclStmt(VarDecl(tmp, Type.int, Some(candidate)))
+          current = current.map(replaceExprInStmt(_, candidate, DeclRef(tmp)))
+          remaining -= 1
+        case None =>
+          remaining = 0
+      }
+    }
+    temps.toSeq -> current
+  }
+
+  private def chooseLoopScopeArrayIndexBase(
+      stmts: Seq[Stmt],
+      stableRefs: Set[String]
+    ): Option[Expr] = {
+    if (stableRefs.isEmpty) {
+      None
+    } else {
+      val counts = scala.collection.mutable.Map.empty[String, (Expr, Int)]
+      stmts.flatMap(collectArrayIndexIntegerSubexprs).foreach { e =>
+        val refs = collectDeclRefs(e)
+        if (refs.nonEmpty && refs.subsetOf(stableRefs)) {
+          val key = C.AST.Printer(e)
+          val (_, count) = counts.getOrElse(key, e -> 0)
+          counts.update(key, e -> (count + 1))
+        }
+      }
+      counts.values.collect {
+        case (e, count)
+            if repeatedExpensiveIntegerOpCandidate(e, count) ||
+               ordinaryCseCandidate(e, count) =>
+          val score =
+            if (repeatedExpensiveIntegerOpCandidate(e, count)) {
+              expensiveIntegerOpCseScore(e, count)
+            } else {
+              ordinaryCseScore(e, count)
+            }
+          (e, score)
+      }.toSeq
+        .sortBy { case (e, score) => (-score, -exprSize(e), e.toString) }
+        .headOption
+        .map(_._1)
+    }
+  }
+
+  private def collectArrayIndexIntegerSubexprs(stmt: Stmt): Seq[Expr] =
+    stmt match {
+      case Block(body) =>
+        body.flatMap(collectArrayIndexIntegerSubexprs)
+      case Stmts(a, b) =>
+        collectArrayIndexIntegerSubexprs(a) ++ collectArrayIndexIntegerSubexprs(b)
+      case DeclStmt(VarDecl(_, _, init)) =>
+        init.toSeq.flatMap(collectArrayIndexIntegerSubexprs)
+      case ExprStmt(Assignment(lhs, rhs)) =>
+        collectArrayIndexIntegerSubexprs(lhs) ++
+          collectArrayIndexIntegerSubexprs(rhs)
+      case ExprStmt(expr) =>
+        collectArrayIndexIntegerSubexprs(expr)
+      case ForLoop(init, cond, increment, body) =>
+        collectArrayIndexIntegerSubexprs(init) ++
+          collectArrayIndexIntegerSubexprs(cond) ++
+          collectArrayIndexIntegerSubexprs(increment) ++
+          collectArrayIndexIntegerSubexprs(body)
+      case WhileLoop(cond, body) =>
+        collectArrayIndexIntegerSubexprs(cond) ++
+          collectArrayIndexIntegerSubexprs(body)
+      case IfThenElse(cond, trueBody, falseBody) =>
+        collectArrayIndexIntegerSubexprs(cond) ++
+          collectArrayIndexIntegerSubexprs(trueBody) ++
+          falseBody.toSeq.flatMap(collectArrayIndexIntegerSubexprs)
+      case _ =>
+        Seq.empty
+    }
+
+  private def collectArrayIndexIntegerSubexprs(expr: Expr): Seq[Expr] =
+    expr match {
+      case ArraySubscript(array, index) =>
+        collectArrayIndexIntegerSubexprs(array) ++
+          collectIntegerSubexprs(index)
+      case BinaryExpr(lhs, _, rhs) =>
+        collectArrayIndexIntegerSubexprs(lhs) ++ collectArrayIndexIntegerSubexprs(rhs)
+      case UnaryExpr(_, e) =>
+        collectArrayIndexIntegerSubexprs(e)
+      case TernaryExpr(cond, thenE, elseE) =>
+        collectArrayIndexIntegerSubexprs(cond) ++
+          collectArrayIndexIntegerSubexprs(thenE) ++
+          collectArrayIndexIntegerSubexprs(elseE)
+      case FunCall(fun, args) =>
+        collectArrayIndexIntegerSubexprs(fun) ++
+          args.flatMap(collectArrayIndexIntegerSubexprs)
+      case Cast(_, e) =>
+        collectArrayIndexIntegerSubexprs(e)
+      case _ =>
+        Seq.empty
+    }
 
   private def inlineSingleUseScalarDecls(stmt: Stmt): Stmt =
     stmt match {
@@ -4514,6 +5014,12 @@ object CleanGeneratedKernelBody {
       case _ => false
     }
 
+  private def declaredNames(stmt: Stmt): Set[String] = {
+    val names = scala.collection.mutable.Set.empty[String]
+    collectDeclNames(stmt, names)
+    names.toSet
+  }
+
   private def collectDeclNames(
       stmt: Stmt,
       names: scala.collection.mutable.Set[String]
@@ -4573,7 +5079,9 @@ object CleanGeneratedKernelBody {
     def isGeneratedTemp(name: String): Boolean =
       name.startsWith("_np_cse") ||
         name.startsWith("_np_block_cse") ||
-        name.startsWith("_np_lhs_idx")
+        name.startsWith("_np_index_cse") ||
+        name.startsWith("_np_lhs_idx") ||
+        name.startsWith("_np_rhs_idx")
 
     def allPrintedGeneratedRefsAreDeclared: Boolean = {
       try {
@@ -4639,10 +5147,10 @@ object CleanGeneratedKernelBody {
   }
 
   private val GeneratedTempPattern =
-    raw"\b(_np_(?:cse|block_cse|lhs_idx)[0-9]+)\b".r
+    raw"\b(_np_(?:cse|block_cse|index_cse|lhs_idx|rhs_idx)[0-9]+)\b".r
 
   private val GeneratedTempDeclPattern =
-    raw"\b(?:int|uint|long|ulong|size_t)\s+(_np_(?:cse|block_cse|lhs_idx)[0-9]+)\b".r
+    raw"\b(?:int|uint|long|ulong|size_t)\s+(_np_(?:cse|block_cse|index_cse|lhs_idx|rhs_idx)[0-9]+)\b".r
 
   private def generatedTempRefsInText(text: String): Set[String] =
     GeneratedTempPattern.findAllMatchIn(text).map(_.group(1)).toSet
@@ -4674,7 +5182,13 @@ object CleanGeneratedKernelBody {
           .getOrElse(BinaryExpr(lhs, op, rhs))
       case BinaryOperator.+ if isZero(lhs) => rhs
       case BinaryOperator.+ if isZero(rhs) => lhs
+      case BinaryOperator.+ if constInt(rhs).isDefined =>
+        addIntegerOffset(lhs, constInt(rhs).get)
+      case BinaryOperator.+ if constInt(lhs).isDefined =>
+        addIntegerOffset(rhs, constInt(lhs).get)
       case BinaryOperator.- if isZero(rhs) => lhs
+      case BinaryOperator.- if constInt(rhs).isDefined =>
+        addIntegerOffset(lhs, -constInt(rhs).get)
       case BinaryOperator.* if isOne(lhs) => rhs
       case BinaryOperator.* if isOne(rhs) => lhs
       case BinaryOperator.* if isZero(lhs) => lhs
@@ -4687,6 +5201,24 @@ object CleanGeneratedKernelBody {
       case BinaryOperator.|| if isZero(lhs) => rhs
       case BinaryOperator.|| if isZero(rhs) => lhs
       case _ => BinaryExpr(lhs, op, rhs)
+    }
+
+  private def addIntegerOffset(expr: Expr, offset: Int): Expr =
+    if (offset == 0) {
+      expr
+    } else {
+      expr match {
+        case BinaryExpr(base, BinaryOperator.+, rhs) if constInt(rhs).isDefined =>
+          addIntegerOffset(base, offset + constInt(rhs).get)
+        case BinaryExpr(lhs, BinaryOperator.+, base) if constInt(lhs).isDefined =>
+          addIntegerOffset(base, offset + constInt(lhs).get)
+        case BinaryExpr(base, BinaryOperator.-, rhs) if constInt(rhs).isDefined =>
+          addIntegerOffset(base, offset - constInt(rhs).get)
+        case _ if offset > 0 =>
+          BinaryExpr(expr, BinaryOperator.+, Literal(offset.toString))
+        case _ =>
+          BinaryExpr(expr, BinaryOperator.-, Literal((-offset).toString))
+      }
     }
 
   private def simplifyModulo(lhs: Expr, rhs: Expr): Expr =
@@ -4736,7 +5268,9 @@ object CleanGeneratedKernelBody {
     }
 
   private def sameExpr(a: Expr, b: Expr): Boolean =
-    a == b || a.toString == b.toString
+    a == b ||
+      cPrinterKey(a).zip(cPrinterKey(b)).exists { case (ka, kb) => ka == kb } ||
+      a.toString == b.toString
 
   private def constInt(expr: Expr): Option[Int] =
     expr match {
